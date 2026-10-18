@@ -137,6 +137,17 @@ constexpr int NSSP = W / 64;  // sum-of-squares parts per row (64-column residua
 #ifndef PI05_D_WPT
 #define PI05_D_WPT 2
 #endif
+// Stage G (round g_batch): 0 = one task at a time; 1 = loads of both tasks of a CTA in flight before any math;
+// 2 = task 1 (g, u) + task 2 g loads, task 1 sums, task 2 u loads, epilogues (fewer live registers).
+#ifndef PI05_G_BATCH
+#define PI05_G_BATCH 0
+#endif
+static_assert(PI05_G_BATCH >= 0 && PI05_G_BATCH <= 2, "PI05_G_BATCH");
+// Stage G loop in its own noinline function (g_phase), so G edits do not reschedule the rest of the kernel.
+#ifndef PI05_G_NOINLINE
+#define PI05_G_NOINLINE 0
+#endif
+static_assert(PI05_G_NOINLINE == 0 || PI05_G_NOINLINE == 1, "PI05_G_NOINLINE");
 // gemm_phase A tile layout (round 11): 0 = row-major [64][AS_STRIDE] (each mma A operand assembled
 // from two LDS.128 by register MOVs); 1 = fragment-interleaved as in gemm_phase_wsplit (one LDS.128 =
 // one A operand, 4-way bank-conflicted 32-bit staging stores); 2 = same tile, thread tid stages rows
@@ -766,9 +777,88 @@ __device__ __forceinline__ float4 reduce_part4(const float* part, int N, int t, 
   return v;
 }
 
+// reduce_part4 split: the S loads, then the in-order sum (same expressions as reduce_part4).
+template <int S>
+__device__ __forceinline__ void part4_load(float4 (&x)[S], const float* part, int N, int t, int c) {
+#pragma unroll
+  for (int s = 0; s < S; ++s) x[s] = __ldcg(reinterpret_cast<const float4*>(part + ((size_t)s * T + t) * N + c));
+}
+
+template <int S>
+__device__ __forceinline__ float4 part4_sum(const float4 (&x)[S]) {
+  float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+  for (int s = 0; s < S; ++s) { v.x += x[s].x; v.y += x[s].y; v.z += x[s].z; v.w += x[s].w; }
+  return v;
+}
+
 __device__ __forceinline__ uint2 pack_bf16x4(float a, float b, float c, float d) {
   __nv_bfloat162 lo = __floats2bfloat162_rn(a, b), hi = __floats2bfloat162_rn(c, d);
   return make_uint2(*reinterpret_cast<uint32_t*>(&lo), *reinterpret_cast<uint32_t*>(&hi));
+}
+
+// Stage G task loop (PI05_G_NOINLINE: its own function, so G edits do not reschedule the rest of the kernel).
+// Same body as the inline block in the kernel; all three PI05_G_BATCH paths.
+__device__ __noinline__ void g_phase(const float* __restrict__ part, bf16* __restrict__ act, const unsigned* cnt, int fuse,
+                                     unsigned it1, bool backoff) {
+  const int tid = threadIdx.x;
+  constexpr int GR = (T + 1) / 2;  // tasks: (32-col group, half of the rows), one quad per thread
+#if PI05_G_BATCH == 0
+  for (int task = gridDim.x - 1 - blockIdx.x; task < 2 * (FF / 32); task += gridDim.x) {
+    const int jg = task >> 1, t = (task & 1) * GR + tid / 8, c = jg * 32 + (tid % 8) * 4;
+    if (fuse & FUSE_FG) block_wait(cnt + (CNT_GU + jg) * CNT_STRIDE, it1 * ARR_GU, backoff);
+    if (tid / 8 < GR && t < T) {
+      const float4 gv = reduce_part4<W / KC>(part, 2 * FF, t, c);
+      const float4 uv = reduce_part4<W / KC>(part, 2 * FF, t, FF + c);
+      *reinterpret_cast<uint2*>(act + t * FF + c) =
+          pack_bf16x4(rbf(gelu_tanh(rbf(gv.x))) * rbf(uv.x), rbf(gelu_tanh(rbf(gv.y))) * rbf(uv.y),
+                      rbf(gelu_tanh(rbf(gv.z))) * rbf(uv.z), rbf(gelu_tanh(rbf(gv.w))) * rbf(uv.w));
+    }
+  }
+#else
+  constexpr int NT = 2 * (FF / 32);
+  constexpr int KS = W / KC;
+  // G epilogue: act[t, c..c+3] = bf16(gelu(rbf(g)) * rbf(u)), the expression of the one-task path.
+  auto g_epi = [&](const float4& gv, const float4& uv, int t, int c) {
+    *reinterpret_cast<uint2*>(act + t * FF + c) =
+        pack_bf16x4(rbf(gelu_tanh(rbf(gv.x))) * rbf(uv.x), rbf(gelu_tanh(rbf(gv.y))) * rbf(uv.y),
+                    rbf(gelu_tanh(rbf(gv.z))) * rbf(uv.z), rbf(gelu_tanh(rbf(gv.w))) * rbf(uv.w));
+  };
+  // Loads of both tasks of this CTA in flight before any math: one L2 round trip per pass, not two.
+  for (int task = gridDim.x - 1 - blockIdx.x; task < NT; task += 2 * gridDim.x) {
+    const int task2 = task + gridDim.x;
+    const bool has2 = task2 < NT;
+    const int tb = has2 ? task2 : task;  // clamp: task 2's address stays valid, no branch around loads
+    const int jg1 = task >> 1, jg2 = tb >> 1;
+    const int t1 = (task & 1) * GR + tid / 8, c1 = jg1 * 32 + (tid % 8) * 4;
+    const int t2 = (tb & 1) * GR + tid / 8, c2 = jg2 * 32 + (tid % 8) * 4;
+    if (fuse & FUSE_FG) {
+      block_wait(cnt + (CNT_GU + jg1) * CNT_STRIDE, it1 * ARR_GU, backoff);
+      block_wait(cnt + (CNT_GU + jg2) * CNT_STRIDE, it1 * ARR_GU, backoff);
+    }
+    // tid / 8 < GR and row half <= 1 give t2 <= GR - 1 + GR = 49 < T whenever t1 < T (T = 50, GR = 25).
+    static_assert(2 * GR - 1 < T, "G batch: task 2 row in range");
+    if (tid / 8 < GR && t1 < T) {
+      float4 g1[KS], u1[KS], g2[KS], u2[KS];
+#if PI05_G_BATCH == 1
+      part4_load<KS>(g1, part, 2 * FF, t1, c1);
+      part4_load<KS>(u1, part, 2 * FF, t1, FF + c1);
+      part4_load<KS>(g2, part, 2 * FF, t2, c2);
+      part4_load<KS>(u2, part, 2 * FF, t2, FF + c2);
+      g_epi(part4_sum<KS>(g1), part4_sum<KS>(u1), t1, c1);
+      if (has2) g_epi(part4_sum<KS>(g2), part4_sum<KS>(u2), t2, c2);
+#else
+      part4_load<KS>(g1, part, 2 * FF, t1, c1);
+      part4_load<KS>(u1, part, 2 * FF, t1, FF + c1);
+      part4_load<KS>(g2, part, 2 * FF, t2, c2);
+      const float4 gv1 = part4_sum<KS>(g1), uv1 = part4_sum<KS>(u1);
+      part4_load<KS>(u2, part, 2 * FF, t2, FF + c2);
+      g_epi(gv1, uv1, t1, c1);
+      if (has2) g_epi(part4_sum<KS>(g2), part4_sum<KS>(u2), t2, c2);
+#endif
+    }
+  }
+#endif
 }
 
 // ------------------------------------------------- FP32 matvec x 10 conds
@@ -1825,7 +1915,11 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
         PF_E(3);
       }
       {
+#if PI05_G_NOINLINE
+        g_phase(p.part, p.act, p.cnt, p.fuse, it1, backoff);
+#else
         constexpr int GR = (T + 1) / 2;  // tasks: (32-col group, half of the rows), one quad per thread
+#if PI05_G_BATCH == 0
         for (int task = gridDim.x - 1 - blockIdx.x; task < 2 * (FF / 32); task += gridDim.x) {
           const int jg = task >> 1, t = (task & 1) * GR + tid / 8, c = jg * 32 + (tid % 8) * 4;
           if (p.fuse & FUSE_FG) block_wait(p.cnt + (CNT_GU + jg) * CNT_STRIDE, it1 * ARR_GU, backoff);
@@ -1837,6 +1931,51 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
                             rbf(gelu_tanh(rbf(gv.z))) * rbf(uv.z), rbf(gelu_tanh(rbf(gv.w))) * rbf(uv.w));
           }
         }
+#else
+        constexpr int NT = 2 * (FF / 32);
+        constexpr int KS = W / KC;
+        // G epilogue: act[t, c..c+3] = bf16(gelu(rbf(g)) * rbf(u)), the expression of the one-task path.
+        auto g_epi = [&](const float4& gv, const float4& uv, int t, int c) {
+          *reinterpret_cast<uint2*>(p.act + t * FF + c) =
+              pack_bf16x4(rbf(gelu_tanh(rbf(gv.x))) * rbf(uv.x), rbf(gelu_tanh(rbf(gv.y))) * rbf(uv.y),
+                          rbf(gelu_tanh(rbf(gv.z))) * rbf(uv.z), rbf(gelu_tanh(rbf(gv.w))) * rbf(uv.w));
+        };
+        // Loads of both tasks of this CTA in flight before any math: one L2 round trip per pass, not two.
+        for (int task = gridDim.x - 1 - blockIdx.x; task < NT; task += 2 * gridDim.x) {
+          const int task2 = task + gridDim.x;
+          const bool has2 = task2 < NT;
+          const int tb = has2 ? task2 : task;  // clamp: task 2's address stays valid, no branch around loads
+          const int jg1 = task >> 1, jg2 = tb >> 1;
+          const int t1 = (task & 1) * GR + tid / 8, c1 = jg1 * 32 + (tid % 8) * 4;
+          const int t2 = (tb & 1) * GR + tid / 8, c2 = jg2 * 32 + (tid % 8) * 4;
+          if (p.fuse & FUSE_FG) {
+            block_wait(p.cnt + (CNT_GU + jg1) * CNT_STRIDE, it1 * ARR_GU, backoff);
+            block_wait(p.cnt + (CNT_GU + jg2) * CNT_STRIDE, it1 * ARR_GU, backoff);
+          }
+          // tid / 8 < GR and row half <= 1 give t2 <= GR - 1 + GR = 49 < T whenever t1 < T (T = 50, GR = 25).
+          static_assert(2 * GR - 1 < T, "G batch: task 2 row in range");
+          if (tid / 8 < GR && t1 < T) {
+            float4 g1[KS], u1[KS], g2[KS], u2[KS];
+#if PI05_G_BATCH == 1
+            part4_load<KS>(g1, p.part, 2 * FF, t1, c1);
+            part4_load<KS>(u1, p.part, 2 * FF, t1, FF + c1);
+            part4_load<KS>(g2, p.part, 2 * FF, t2, c2);
+            part4_load<KS>(u2, p.part, 2 * FF, t2, FF + c2);
+            g_epi(part4_sum<KS>(g1), part4_sum<KS>(u1), t1, c1);
+            if (has2) g_epi(part4_sum<KS>(g2), part4_sum<KS>(u2), t2, c2);
+#else
+            part4_load<KS>(g1, p.part, 2 * FF, t1, c1);
+            part4_load<KS>(u1, p.part, 2 * FF, t1, FF + c1);
+            part4_load<KS>(g2, p.part, 2 * FF, t2, c2);
+            const float4 gv1 = part4_sum<KS>(g1), uv1 = part4_sum<KS>(u1);
+            part4_load<KS>(u2, p.part, 2 * FF, t2, FF + c2);
+            g_epi(gv1, uv1, t1, c1);
+            if (has2) g_epi(part4_sum<KS>(g2), part4_sum<KS>(u2), t2, c2);
+#endif
+          }
+        }
+#endif
+#endif
       }
       STOP_AT(7)
 #if !(PI05_WPRE & 4)

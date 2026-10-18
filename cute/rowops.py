@@ -166,13 +166,19 @@ def action_in_tasks(noise, aw, ab, h2, ssp, xbuf, copy_x: cutlass.Constexpr):
 
 
 @cute.jit
-def reduce_part4(part, S_: cutlass.Constexpr, N: cutlass.Constexpr, t, c):
-    """reduce_part4<S>: sum over s = 0..S-1 (in order, from +0.0) of part[s][t][c .. c+3], all S .cg float4 loads in flight."""
+def part4_load(part, S_: cutlass.Constexpr, N: cutlass.Constexpr, t, c):
+    """the S .cg float4 loads of reduce_part4 (all in flight), returns the (S, 4) register tensor"""
     cg4 = S.cg_atom(Float32, 128)
     flat = cute.make_tensor(part.iterator, cute.make_layout(S_ * T * N))
     x = rm_tensor((S_, 4))
     for s in cutlass.range_constexpr(S_):
         cute.copy(cg4, cute.local_tile(flat, (4,), (((s * T + t) * N + c) // 4,)), x[s, None])
+    return x
+
+
+@cute.jit
+def part4_sum(x, S_: cutlass.Constexpr):
+    """sum over s = 0..S-1 in order from +0.0, per element; returns the (4,) register tensor"""
     v = rm_tensor((4,))
     for e in cutlass.range_constexpr(4):
         a = Float32(0.0)
@@ -180,6 +186,12 @@ def reduce_part4(part, S_: cutlass.Constexpr, N: cutlass.Constexpr, t, c):
             a = a + x[s, e]
         v[e] = a
     return v
+
+
+@cute.jit
+def reduce_part4(part, S_: cutlass.Constexpr, N: cutlass.Constexpr, t, c):
+    """reduce_part4<S>: sum over s = 0..S-1 (in order, from +0.0) of part[s][t][c .. c+3], all S .cg float4 loads in flight."""
+    return part4_sum(part4_load(part, S_, N, t, c), S_)
 
 
 @cute.jit

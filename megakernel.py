@@ -26,6 +26,30 @@ ORDER = ("action_in_weight", "action_in_bias", "time_in_weight", "time_in_bias",
 ATT_KEYS = (64, 32, 16)
 
 
+def parse_variant(variant: str) -> dict:
+    """``k64`` -> {att_keys: 64, g_batch: 0, g_noinline: 0}; suffixes after ``k<N>`` in any order, each at most once:
+    ``gb<0|1|2>`` = stage G load batching (PI05_G_BATCH / Knobs.g_batch), ``gn`` = stage G as a noinline function
+    (PI05_G_NOINLINE; CUDA only). E.g. ``k64-gb1``, ``k64-gn``, ``k64-gb1-gn``. Shared by the CUDA and CuTe arms so they
+    cannot drift."""
+    keys, *suffixes = variant.split("-")
+    if not keys.startswith("k") or not keys[1:].isdigit():
+        raise ValueError(f"bad variant {variant!r}: expected k<att_keys>[-gb<0|1|2>][-gn]")
+    out = {"att_keys": int(keys[1:]), "g_batch": 0, "g_noinline": 0}
+    seen = set()
+    for suffix in suffixes:
+        kind = "gn" if suffix == "gn" else "gb" if suffix in ("gb0", "gb1", "gb2") else None
+        if kind is None:
+            raise ValueError(f"bad variant suffix {suffix!r} in {variant!r}: expected gb0, gb1, gb2 or gn")
+        if kind in seen:
+            raise ValueError(f"duplicate variant suffix {suffix!r} in {variant!r}")
+        seen.add(kind)
+        if kind == "gn":
+            out["g_noinline"] = 1
+        else:
+            out["g_batch"] = int(suffix[2:])
+    return out
+
+
 def variants() -> tuple[str, ...]:
     return tuple(f"k{k}" for k in ATT_KEYS)
 
@@ -59,7 +83,12 @@ class MegakernelArm:
                              "18 layers, 10 steps")
         self.variant = variant
         self.fuse = FUSE if fuse is None else fuse
-        self.att_keys = int(variant.lstrip("k"))
+        pv = parse_variant(variant)
+        self.att_keys, self.g_batch, self.g_noinline = pv["att_keys"], pv["g_batch"], pv["g_noinline"]
+        if self.g_batch:  # gb0 is the plain build (same extension name)
+            extra = (*extra, f"-DPI05_G_BATCH={self.g_batch}")
+        if self.g_noinline:
+            extra = (*extra, "-DPI05_G_NOINLINE=1")
         self.geo = geo
         self.ext = load(geo.prefix, self.att_keys, extra)
         self.device = torch.device(device)
@@ -72,7 +101,7 @@ class MegakernelArm:
         self.actions = torch.empty((geo.horizon, geo.action_dim), dtype=torch.float32,
                                    device=self.device)
         self.tensors: list[torch.Tensor] | None = None
-        self.config = {"att_keys": self.att_keys, "fuse": self.fuse, "prefix": geo.prefix,
+        self.config = {"att_keys": self.att_keys, "g_batch": self.g_batch, "g_noinline": self.g_noinline, "fuse": self.fuse, "prefix": geo.prefix,
                        "launches_per_chunk": 1}
 
     def bind(self, inputs: dict) -> None:

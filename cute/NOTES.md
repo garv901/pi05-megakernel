@@ -319,6 +319,9 @@ Knobs / how to run: `--fuse 50` (= 18 + 32) in `parity.py`, `perf.py`, `profile.
 `compare_stages` leaves `part` out of the stop B / C3 compares of FUSE_ABL builds (D / F / H overwrite it and still compare).
 Sbatch: `slurm/abl_parity.sbatch`, `slurm/abl_perf.sbatch` (`CFG="968 64"` for the second config).
 
+## Stage G load batching (`Knobs.g_batch`)
+`g_batch` 1 makes each CTA of stage G issue the loads of both of its tasks (32 float4 `.cg` loads) before any math, so a 2-task CTA pays one L2 round trip instead of two; `g_batch` 2 loads task 2's up half after task 1's sums (about 96 floats live). Every element keeps the same arithmetic (8 partials from +0.0 in order, `gelu_mul`, bf16 pack) and the same tasks per CTA, so the result is bit-exact by construction; the `g_batch` 0 PTX is unchanged. The default stays 0 until the GPU A/B (`parity.py --g-batch`, `perf.py --g-batch`). CPU result (P968 k64): ptxas does not keep all loads ahead of the first FADD and STACK changes, see `specs/SPEC-g-batch.md` Results.
+
 # Unverified — rederive before use
 Moved here from the sections above; none of these is supported by a log or a file in the repo.
 - Two fresh processes both compile the `pro` build in about 4.1 s (no DSL file-cache benefit). Rederive: time `arm.cpu_arm(Knobs(128, 16), Stop('pro'))` in two fresh processes.

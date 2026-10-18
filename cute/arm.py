@@ -9,7 +9,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from ..fixture import Geometry
-from ..megakernel import ORDER
+from ..megakernel import ORDER, parse_variant
 from .config import ADIM, NSTEP, NUM_SMS, L, T, Knobs, workspace_layout
 from .kernel import Stop, compile_kernel, input_specs
 
@@ -23,7 +23,10 @@ class CuteArm:
         if (geo.horizon, geo.action_dim, geo.layers, geo.steps) != (50, 32, 18, 10):
             raise ValueError("the megakernel is specialized for horizon 50, action 32, 18 layers, 10 steps")
         self.geo = geo
-        self.knobs = knobs or Knobs(prefix=geo.prefix, att_keys=int(variant.lstrip("k")))
+        pv = parse_variant(variant)
+        if pv["g_noinline"]:
+            raise ValueError(f"variant {variant!r}: gn (G noinline) is not supported by the CuTe arm")
+        self.knobs = knobs or Knobs(prefix=geo.prefix, att_keys=pv["att_keys"], g_batch=pv["g_batch"])
         if self.knobs.prefix != geo.prefix:
             raise ValueError("knobs.prefix must equal geo.prefix")
         self.stop = stop or Stop()
@@ -44,7 +47,7 @@ class CuteArm:
         self.args = None
         self.fn = None
         self.n_steps, self.n_layers = NSTEP, L  # runtime counts (parity.py truncates them for debugging)
-        self.config = {"att_keys": self.knobs.att_keys, "fuse": self.knobs.fuse, "prefix": geo.prefix,
+        self.config = {"att_keys": self.knobs.att_keys, "g_batch": self.knobs.g_batch, "fuse": self.knobs.fuse, "prefix": geo.prefix,
                        "launches_per_chunk": 1, "stop": self.stop.stage, "impl": "cute"}
 
     def bind(self, inputs: dict) -> None:

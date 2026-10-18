@@ -66,6 +66,7 @@ class Knobs:
     fuse: int = 18
     wpre: int = 15
     d_wpt: int = 2
+    g_batch: int = 0  # stage G load batching, bit-exact: 1 = loads of both of a CTA's tasks before any math, 2 = same with task 2's up loads after task 1's sums (default off until the GPU A/B)
     host_zero: bool = False  # True: the host zeroes cnt..bar before each launch (phase 5); False: last-CTA-out reset in the kernel
 
     def __post_init__(self):
@@ -79,6 +80,8 @@ class Knobs:
             raise ValueError("attention units must fit one wave")
         if NWARPS % self.d_wpt or 4 % self.d_wpt:
             raise ValueError("d_wpt must divide 4 and the warp count")
+        if self.g_batch not in (0, 1, 2):
+            raise ValueError("g_batch must be 0, 1 or 2")
         if not 0 <= self.wpre <= 15 or not 0 <= self.fuse < 64:
             raise ValueError("wpre / fuse bits out of range")
         if self.fuse & FUSE_ABL and self.fuse & FUSE_AB:

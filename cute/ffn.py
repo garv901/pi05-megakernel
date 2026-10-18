@@ -123,6 +123,16 @@ def stage_f(v, wg, wu, l, modstep, epoch, nb, knobs: cutlass.Constexpr):
 
 
 @cute.jit
+def g_epilogue(gv, uv, act, t, c):
+    """G epilogue of one task (g_batch path): GeGLU of the 4 summed (gate, up) pairs, bf16 pack, one 64-bit store at act[t, c]."""
+    ob = R.rm_tensor((4,), BFloat16)
+    for e in cutlass.range_constexpr(4):
+        ob[e] = X.gelu_mul(gv[e], uv[e]).to(BFloat16)
+    out = cute.make_tensor(gptr(BFloat16, act + ((t * FF + c) * 2).to(Int64), 8), cute.make_layout(4))
+    cute.copy(cute.make_copy_atom(CopyUniversalOp(), BFloat16, num_bits_per_copy=64), ob, out)
+
+
+@cute.jit
 def stage_g(v, wq, wk, wv, l, it1, n_layers, epoch, nb, knobs: cutlass.Constexpr):
     """G: [barrier unless FUSE_FG], prefetch the next layer's QKV weights, GeGLU per 32-column group once its 16 tiles arrived."""
     fuse_fg = bool(knobs.fuse & FUSE_FG)
@@ -140,20 +150,56 @@ def stage_g(v, wq, wk, wv, l, it1, n_layers, epoch, nb, knobs: cutlass.Constexpr
     bid, _, _ = cute.arch.block_idx()
     nbk, _, _ = cute.arch.grid_dim()
     act = v["act"].iterator.toint()
-    for task in cutlass.range(nbk - 1 - bid, 2 * (FF // 32), nbk, unroll=1):
-        jg = task >> 1
-        t = (task & 1) * GR + tid // 8
-        c = jg * 32 + (tid % 8) * 4
-        if cutlass.const_expr(fuse_fg):
-            S.block_wait(v["cnt"].iterator + (CNT_GU + jg) * CNT_STRIDE, (it1 * ARR_GU).to(Uint32), backoff)
-        if (tid // 8 < GR) & (t < T):
-            gv = R.reduce_part4(v["part"], W // KC, 2 * FF, t, c)
-            uv = R.reduce_part4(v["part"], W // KC, 2 * FF, t, FF + c)
-            ob = R.rm_tensor((4,), BFloat16)
-            for e in cutlass.range_constexpr(4):
-                ob[e] = X.gelu_mul(gv[e], uv[e]).to(BFloat16)
-            out = cute.make_tensor(gptr(BFloat16, act + ((t * FF + c) * 2).to(Int64), 8), cute.make_layout(4))
-            cute.copy(cute.make_copy_atom(CopyUniversalOp(), BFloat16, num_bits_per_copy=64), ob, out)
+    if cutlass.const_expr(not knobs.g_batch):
+        for task in cutlass.range(nbk - 1 - bid, 2 * (FF // 32), nbk, unroll=1):
+            jg = task >> 1
+            t = (task & 1) * GR + tid // 8
+            c = jg * 32 + (tid % 8) * 4
+            if cutlass.const_expr(fuse_fg):
+                S.block_wait(v["cnt"].iterator + (CNT_GU + jg) * CNT_STRIDE, (it1 * ARR_GU).to(Uint32), backoff)
+            if (tid // 8 < GR) & (t < T):
+                gv = R.reduce_part4(v["part"], W // KC, 2 * FF, t, c)
+                uv = R.reduce_part4(v["part"], W // KC, 2 * FF, t, FF + c)
+                ob = R.rm_tensor((4,), BFloat16)
+                for e in cutlass.range_constexpr(4):
+                    ob[e] = X.gelu_mul(gv[e], uv[e]).to(BFloat16)
+                out = cute.make_tensor(gptr(BFloat16, act + ((t * FF + c) * 2).to(Int64), 8), cute.make_layout(4))
+                cute.copy(cute.make_copy_atom(CopyUniversalOp(), BFloat16, num_bits_per_copy=64), ob, out)
+    else:
+        # g_batch 1 / 2: the loads of both of a CTA's tasks are in flight before any math (one L2 round trip per pass, not one per task)
+        NT = 2 * (FF // 32)
+        for task in cutlass.range(nbk - 1 - bid, NT, 2 * nbk, unroll=1):
+            task2 = task + nbk
+            has2 = task2 < NT
+            tb = cutlass.select_(has2, task2, task)  # clamp: the second set of loads stays valid without a second task
+            jg1 = task >> 1
+            jg2 = tb >> 1
+            t1 = (task & 1) * GR + tid // 8
+            c1 = jg1 * 32 + (tid % 8) * 4
+            t2 = (tb & 1) * GR + tid // 8
+            c2 = jg2 * 32 + (tid % 8) * 4
+            if cutlass.const_expr(fuse_fg):
+                S.block_wait(v["cnt"].iterator + (CNT_GU + jg1) * CNT_STRIDE, (it1 * ARR_GU).to(Uint32), backoff)
+                S.block_wait(v["cnt"].iterator + (CNT_GU + jg2) * CNT_STRIDE, (it1 * ARR_GU).to(Uint32), backoff)
+            if (tid // 8 < GR) & (t1 < T):  # t2 < T holds whenever this guard does (row half <= 1, tid // 8 <= 24)
+                if cutlass.const_expr(knobs.g_batch == 1):
+                    xg1 = R.part4_load(v["part"], W // KC, 2 * FF, t1, c1)
+                    xu1 = R.part4_load(v["part"], W // KC, 2 * FF, t1, FF + c1)
+                    xg2 = R.part4_load(v["part"], W // KC, 2 * FF, t2, c2)
+                    xu2 = R.part4_load(v["part"], W // KC, 2 * FF, t2, FF + c2)
+                    g_epilogue(R.part4_sum(xg1, W // KC), R.part4_sum(xu1, W // KC), act, t1, c1)
+                    if has2:
+                        g_epilogue(R.part4_sum(xg2, W // KC), R.part4_sum(xu2, W // KC), act, t2, c2)
+                else:  # g_batch 2: about 96 floats live, task 2's up loads wait for task 1's sums
+                    xg1 = R.part4_load(v["part"], W // KC, 2 * FF, t1, c1)
+                    xu1 = R.part4_load(v["part"], W // KC, 2 * FF, t1, FF + c1)
+                    xg2 = R.part4_load(v["part"], W // KC, 2 * FF, t2, c2)
+                    gv1 = R.part4_sum(xg1, W // KC)
+                    uv1 = R.part4_sum(xu1, W // KC)
+                    xu2 = R.part4_load(v["part"], W // KC, 2 * FF, t2, FF + c2)
+                    g_epilogue(gv1, uv1, act, t1, c1)
+                    if has2:
+                        g_epilogue(R.part4_sum(xg2, W // KC), R.part4_sum(xu2, W // KC), act, t2, c2)
     return epoch
 
 

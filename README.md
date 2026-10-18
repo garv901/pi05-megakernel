@@ -9,7 +9,7 @@ One launch of every arm = one complete action chunk (`actions` [50, 32] fp32).
 | file | what |
 |---|---|
 | `mk/pi05_mk.cu` | Keisuke's final megakernel (v18), only change: `PI05_PREFIX` compile-time prefix |
-| `megakernel.py` | arm; variants `k64/k32/k16` = `PI05_ATT_KEYS` (attention key chunk) |
+| `megakernel.py` | arm; variants `k64/k32/k16` = `PI05_ATT_KEYS` (attention key chunk); optional suffix `-gb1` / `-gb2` = `PI05_G_BATCH` (stage G loads of a CTA's two tasks batched, bit-exact; CuTe arm: `Knobs.g_batch`). Default 0 until the GPU A/B; `gbatch_equal.py` checks bitwise equality |
 | `cute/` | CuTe DSL (cutlass-dsl) port of the megakernel (`cute/NOTES.md`); arm `cute` in `bench.py` (opt-in `--arms megakernel,cute`) |
 | `sota_graph.py` | FlashInfer/cuBLAS/cuDNN GEMMs + Triton attention + fused Triton glue, 1 CUDA graph, PDL; autotuned per op (L2-cold) then refined end to end in the full graph |
 | `triton_ops.py` | PDL Triton kernels: residual+adaRMS, RoPE+KV append, step boundary, GQA attention |
