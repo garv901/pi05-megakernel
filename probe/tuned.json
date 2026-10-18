@@ -1,0 +1,16 @@
+{
+ "source": "megabench/sota/pi05/runs/20261016T004914Z-p128/records.jsonl",
+ "gemm": {
+  "qkv": "tgv",
+  "o": "cublas",
+  "gu": "cublaslt",
+  "down": "cudnn"
+ },
+ "attn": {
+  "kind": "triton",
+  "bm": 16,
+  "bn": 64,
+  "warps": 8,
+  "stages": 1
+ }
+}

@@ -1,0 +1,17 @@
+# code only: run artifacts stay on disk
+runs/
+probe/ncu_artifacts/
+__pycache__/
+*.pyc
+*.cubin
+*.ptx
+*.npz
+*.npy
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+*.pftrace
+# compiled ubench executables
+probe/ubench/sync_cost
+probe/ubench/chain_pdl
+probe/ubench/hbm_ramp
