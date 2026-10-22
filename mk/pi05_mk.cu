@@ -152,6 +152,14 @@ constexpr int NSSP = W / 64;  // sum-of-squares parts per row (64-column residua
 #ifndef PI05_LOAD_HOIST
 #define PI05_LOAD_HOIST 1
 #endif
+// gemm_phase task order inside a K chunk: 0 = slot-major (ng = slot * NWARPS + warp: the first blocks' 8 warps take the first
+// tiles, so A's 640 tiles fill 80 SMs and 68 idle); 1 = warp-major (ng = warp * nblk + slot: every block's low warps first,
+// 4-5 busy warps on every SM). Same tiles, chunks and math (bit-identical); only the SM / warp that runs a tile changes.
+// Default 1 since job 8794 (bench, L2 flushed): 8.056 ms vs 8.166 (-1.35%), 0 spills; U9: fewer warps per SM storing
+// partials at once (A phase 3.20 -> 2.75 us); variant -nosp = 0.
+#ifndef PI05_GEMM_SPREAD
+#define PI05_GEMM_SPREAD 1
+#endif
 // Per-step tail and step-0 input with the grid-parallel residual (fuse bit 16), round 14: 0 = row-serial
 // (residual_row last-layer branch: final norm, action_out, Euler, action_in + attention norm on 50 blocks);
 // 1 = last-layer residual_tasks writes h / ssp, SYNC, action_out + Euler as (row, 16 dims) block tasks
@@ -441,7 +449,7 @@ __device__ __noinline__ void gemm_phase(const bf16* __restrict__ A, int K, const
   const int nblk = (gridDim.x - s + S - 1) / S;  // blocks sharing chunk s
   const int k0 = s * KC;
   const uint4 zero = make_uint4(0, 0, 0, 0);
-  int ng = slot * NWARPS + warp;
+  int ng = PI05_GEMM_SPREAD ? warp * nblk + slot : slot * NWARPS + warp;
   const int ng_step = nblk * NWARPS;
 
   auto load_w = [&](int ngi, uint4 (&b)[4][4]) {
