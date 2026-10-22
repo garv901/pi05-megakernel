@@ -160,6 +160,13 @@ constexpr int NSSP = W / 64;  // sum-of-squares parts per row (64-column residua
 #ifndef PI05_GEMM_SPREAD
 #define PI05_GEMM_SPREAD 1
 #endif
+// Split-K partial precision in part[]: 0 = fp32; 1 = bf16 (RN), half the partial store and reduce bytes. Consumers still sum
+// the S partials in fp32 in the same order. Not bit-identical (gate: fixture.band). U9 (job 8798): 128-k task 3.23 -> 2.98 us,
+// A and H phases -0.22 us. Default 1 since job 8802 (bench, L2 flushed): 7.959 ms vs 8.020 (-0.76%), band pass on 3 seeds
+// (rel err 0.00295-0.00307 vs reference 0.00293-0.00299), 0 spills; variant -nopb = 0.
+#ifndef PI05_PART_BF16
+#define PI05_PART_BF16 1
+#endif
 // Per-step tail and step-0 input with the grid-parallel residual (fuse bit 16), round 14: 0 = row-serial
 // (residual_row last-layer branch: final norm, action_out, Euler, action_in + attention norm on 50 blocks);
 // 1 = last-layer residual_tasks writes h / ssp, SYNC, action_out + Euler as (row, 16 dims) block tasks
@@ -436,6 +443,31 @@ __device__ __forceinline__ float gelu_tanh(float x) {
 // once; its warps take 32-column units of that chunk. Within a 32-wide k slab
 // each lane loads 8 contiguous bf16; A and B use the same k permutation so the
 // dot product is unchanged.
+#if PI05_PART_BF16
+// bf16 part[] accessors; idx counts bf16 elements, so the layout part[s][t][n] is unchanged. The fp32 build keeps its
+// original float stores and loads verbatim (any source change there reschedules the register-saturated kernel).
+__device__ __forceinline__ void part_st2(float* part, size_t idx, float a, float b) {
+  *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<bf16*>(part) + idx) = __floats2bfloat162_rn(a, b);
+}
+__device__ __forceinline__ void part_st4(float* part, size_t idx, float4 v) {
+  __nv_bfloat162 lo = __floats2bfloat162_rn(v.x, v.y), hi = __floats2bfloat162_rn(v.z, v.w);
+  *reinterpret_cast<uint2*>(reinterpret_cast<bf16*>(part) + idx) =
+      make_uint2(*reinterpret_cast<uint32_t*>(&lo), *reinterpret_cast<uint32_t*>(&hi));
+}
+__device__ __forceinline__ float part_ld(const float* part, size_t idx) {
+  return __uint_as_float((unsigned)__ldcg(reinterpret_cast<const unsigned short*>(part) + idx) << 16);
+}
+__device__ __forceinline__ float2 part_ld2(const float* part, size_t idx) {
+  const unsigned u = __ldcg(reinterpret_cast<const unsigned*>(reinterpret_cast<const bf16*>(part) + idx));
+  return make_float2(__uint_as_float(u << 16), __uint_as_float(u & 0xffff0000u));
+}
+__device__ __forceinline__ float4 part_ld4(const float* part, size_t idx) {
+  const uint2 u = __ldcg(reinterpret_cast<const uint2*>(reinterpret_cast<const bf16*>(part) + idx));
+  return make_float4(__uint_as_float(u.x << 16), __uint_as_float(u.x & 0xffff0000u), __uint_as_float(u.y << 16),
+                     __uint_as_float(u.y & 0xffff0000u));
+}
+#endif
+
 constexpr int AS_STRIDE = KC + 32;  // bf16; 16B fragment loads are conflict-free
 
 __device__ __noinline__ void gemm_phase(const bf16* __restrict__ A, int K, const bf16* w0, int n1, const bf16* w1, int n2,
@@ -614,11 +646,16 @@ __device__ __noinline__ void gemm_phase(const bf16* __restrict__ A, int K, const
 #pragma unroll
       for (int nt = 0; nt < 4; ++nt) {
         const int r0 = mt * 16 + g, c = n0 + nt * 8 + 2 * t4;
+#if PI05_PART_BF16
+        if (r0 < T) part_st2(part, ((size_t)s * T + r0) * N + c, acc[mt][nt][0], acc[mt][nt][1]);
+        if (r0 + 8 < T) part_st2(part, ((size_t)s * T + r0 + 8) * N + c, acc[mt][nt][2], acc[mt][nt][3]);
+#else
         if (r0 < T)
           *reinterpret_cast<float2*>(part + ((size_t)s * T + r0) * N + c) = make_float2(acc[mt][nt][0], acc[mt][nt][1]);
         if (r0 + 8 < T)
           *reinterpret_cast<float2*>(part + ((size_t)s * T + r0 + 8) * N + c) =
               make_float2(acc[mt][nt][2], acc[mt][nt][3]);
+#endif
       }
 #if !PI05_LOAD_HOIST
     if (ng + ng_step < NG) load_w(ng + ng_step, b);
@@ -752,7 +789,11 @@ __device__ __noinline__ void gemm_phase_wsplit(const bf16* __restrict__ A, int K
           const float4 u = *reinterpret_cast<const float4*>(grp + (w * T + r) * WS_STRIDE + c4);
           v.x += u.x; v.y += u.y; v.z += u.z; v.w += u.w;
         }
+#if PI05_PART_BF16
+        part_st4(part, ((size_t)s * T + r) * N + n0 + c4, v);
+#else
         *reinterpret_cast<float4*>(part + ((size_t)s * T + r) * N + n0 + c4) = v;
+#endif
       }
     }
     if (ng + ng_step < NG) {
@@ -766,7 +807,11 @@ template <int S>
 __device__ __forceinline__ float reduce_part(const float* part, int N, int t, int c) {
   float x[S];
 #pragma unroll
+#if PI05_PART_BF16
+  for (int s = 0; s < S; ++s) x[s] = part_ld(part, ((size_t)s * T + t) * N + c);
+#else
   for (int s = 0; s < S; ++s) x[s] = __ldcg(part + ((size_t)s * T + t) * N + c);
+#endif
   float v = 0.f;
 #pragma unroll
   for (int s = 0; s < S; ++s) v += x[s];
@@ -778,7 +823,11 @@ template <int S>
 __device__ __forceinline__ float4 reduce_part4(const float* part, int N, int t, int c) {
   float4 x[S];
 #pragma unroll
+#if PI05_PART_BF16
+  for (int s = 0; s < S; ++s) x[s] = part_ld4(part, ((size_t)s * T + t) * N + c);
+#else
   for (int s = 0; s < S; ++s) x[s] = __ldcg(reinterpret_cast<const float4*>(part + ((size_t)s * T + t) * N + c));
+#endif
   float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
   for (int s = 0; s < S; ++s) { v.x += x[s].x; v.y += x[s].y; v.z += x[s].z; v.w += x[s].w; }
@@ -944,7 +993,11 @@ __device__ __forceinline__ void residual_tasks(const Params& p, const float* gat
     const int t = task / NSSP, c = (task % NSSP) * 64 + lane * 2;
     float2 x[S];
 #pragma unroll
+#if PI05_PART_BF16
+    for (int s = 0; s < S; ++s) x[s] = part_ld2(p.part, ((size_t)s * T + t) * W + c);
+#else
     for (int s = 0; s < S; ++s) x[s] = __ldcg(reinterpret_cast<const float2*>(p.part + ((size_t)s * T + t) * W + c));
+#endif
     const float2 gv = __ldcg(reinterpret_cast<const float2*>(gate + c));
     const unsigned hraw = __ldcg(reinterpret_cast<const unsigned*>(p.h + t * W + c));
     const __nv_bfloat162 hold = *reinterpret_cast<const __nv_bfloat162*>(&hraw);

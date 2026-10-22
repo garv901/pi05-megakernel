@@ -29,14 +29,16 @@ ATT_KEYS = (64, 32, 16)
 def parse_variant(variant: str) -> dict:
     """``k64`` -> {att_keys: 64, load_hoist: 0, hoist_off: False, spread_off: False}; optional suffixes, each at most once:
     ``lh`` = Knobs.load_hoist 1 (CuTe: gemm_phase next-tile weight load hoisted above the partial stores), ``nolh`` = CUDA
-    built with PI05_LOAD_HOIST=0 (not with lh), ``nosp`` = CUDA built with PI05_GEMM_SPREAD=0 (slot-major gemm_phase tasks).
+    built with PI05_LOAD_HOIST=0 (not with lh), ``nosp`` = CUDA built with PI05_GEMM_SPREAD=0 (slot-major gemm_phase tasks),
+    ``nopb`` = CUDA built with PI05_PART_BF16=0 (fp32 split-K partials, the pre-job-8802 build).
+    The CUDA kernel also uses bf16 partials by default (PI05_PART_BF16 default 1), so ``k64-nopb`` is that A/B control.
     The CUDA kernel hoists and spreads by default (both macros default 1), so for the CUDA arm ``k64`` and ``k64-lh`` are the
     same build and ``k64-nolh`` / ``k64-nosp`` are the A/B controls. The CuTe arm reads att_keys and load_hoist only.
     E.g. ``k64-nosp``. Shared by the CUDA and CuTe arms so they cannot drift."""
     keys, *suffixes = variant.split("-")
     if not keys.startswith("k") or not keys[1:].isdigit():
-        raise ValueError(f"bad variant {variant!r}: expected k<att_keys>[-lh|-nolh][-nosp]")
-    out = {"att_keys": int(keys[1:]), "load_hoist": 0, "hoist_off": False, "spread_off": False}
+        raise ValueError(f"bad variant {variant!r}: expected k<att_keys>[-lh|-nolh][-nosp][-nopb]")
+    out = {"att_keys": int(keys[1:]), "load_hoist": 0, "hoist_off": False, "spread_off": False, "part_bf16_off": False}
     if len(set(suffixes)) != len(suffixes):
         raise ValueError(f"duplicate variant suffix in {variant!r}")
     if "lh" in suffixes and "nolh" in suffixes:
@@ -48,8 +50,10 @@ def parse_variant(variant: str) -> dict:
             out["hoist_off"] = True
         elif suffix == "nosp":
             out["spread_off"] = True
+        elif suffix == "nopb":
+            out["part_bf16_off"] = True
         else:
-            raise ValueError(f"bad variant suffix {suffix!r} in {variant!r}: expected lh, nolh or nosp")
+            raise ValueError(f"bad variant suffix {suffix!r} in {variant!r}: expected lh, nolh, nosp or nopb")
     return out
 
 
@@ -93,6 +97,9 @@ class MegakernelArm:
         self.spread = not pv["spread_off"]
         if not self.spread and "-DPI05_GEMM_SPREAD=0" not in extra:  # the plain build spreads (PI05_GEMM_SPREAD default 1)
             extra = (*extra, "-DPI05_GEMM_SPREAD=0")
+        self.part_bf16 = not pv["part_bf16_off"]
+        if not self.part_bf16 and "-DPI05_PART_BF16=0" not in extra:  # the plain build uses bf16 partials (PI05_PART_BF16 default 1)
+            extra = (*extra, "-DPI05_PART_BF16=0")
         self.geo = geo
         self.ext = load(geo.prefix, self.att_keys, extra)
         self.device = torch.device(device)
@@ -105,7 +112,7 @@ class MegakernelArm:
         self.actions = torch.empty((geo.horizon, geo.action_dim), dtype=torch.float32,
                                    device=self.device)
         self.tensors: list[torch.Tensor] | None = None
-        self.config = {"att_keys": self.att_keys, "load_hoist": self.load_hoist, "spread": int(self.spread), "fuse": self.fuse, "prefix": geo.prefix,
+        self.config = {"att_keys": self.att_keys, "load_hoist": self.load_hoist, "spread": int(self.spread), "part_bf16": int(self.part_bf16), "fuse": self.fuse, "prefix": geo.prefix,
                        "launches_per_chunk": 1}
 
     def bind(self, inputs: dict) -> None:
