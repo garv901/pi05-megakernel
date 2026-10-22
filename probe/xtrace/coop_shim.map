@@ -1,0 +1,7 @@
+libcudart.so.13 {
+  global: cudaLaunchCooperativeKernel;
+};
+XT_SHIM {
+  global: xt_load; xt_set; xt_count; xt_set_extra;
+  local: *;
+};

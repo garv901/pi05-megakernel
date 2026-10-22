@@ -1,5 +1,6 @@
 """Per-phase table (A..I) of graph-pdl / graph-nopdl from nsys cuda_gpu_trace CSVs at any prefix.
-Handles 9 kernels/layer (single attention kernel) and 10 (attention + split-KV merge kernel, both counted in C_attn).
+Handles 9 kernels/layer (single attention kernel), 10 (attention + split-KV merge kernel, both counted in C_attn)
+and 11 (also down GEMM + split-K reduce, both counted in H_down; P968).
 usage: python -m megabench.sota.pi05.probe.phase_table PREFIX pdl_trace.csv nopdl_trace.csv > table.md"""
 import sys
 import numpy as np
@@ -13,8 +14,9 @@ def analyze(rep):
     s0 = G.find_layer_start(rep)
     ropes = [i for i, r in enumerate(rep) if "_rope_kv_kernel" in r["Name"]]
     nk = ropes[1] - ropes[0]
-    assert nk in (9, 10), nk
-    pmap = list(range(9)) if nk == 9 else [0, 1, 2, 2, 3, 4, 5, 6, 7, 8]
+    pmaps = {9: list(range(9)), 10: [0, 1, 2, 2, 3, 4, 5, 6, 7, 8], 11: [0, 1, 2, 2, 3, 4, 5, 6, 7, 7, 8]}
+    assert nk in pmaps, nk
+    pmap = pmaps[nk]
     ks = rep[s0:s0 + NSTEP * L * nk]
     assert len(ks) == NSTEP * L * nk
     st = np.array([int(r["Start (ns)"]) for r in ks]); du = np.array([int(r["Duration (ns)"]) for r in ks]); en = st + du

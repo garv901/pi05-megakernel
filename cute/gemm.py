@@ -15,6 +15,7 @@ import cutlass.cute as cute
 from cutlass import BFloat16, Boolean, Float32, Int32, Int64, Uint32
 from cutlass.cute.nvgpu import CopyUniversalOp
 
+from . import fit_marks as FM
 from . import iket_marks as IM
 from . import mathx as X
 from . import rowops as R
@@ -188,6 +189,8 @@ def gemm_phase(A, w0, w1, w2, part, bar, pend, target, cnt, ssp, nmod,
         acc.fill(0.0)
         if cutlass.const_expr(IM.GEMM):
             IM.gmark_dep("g_wrdy", rB, gscr)
+        if cutlass.const_expr(FM.MODE):  # PI05_FIT: plain point entry at the g_wrdy site (no fold)
+            IM.gmark("g_wrdy")
         for kb in cutlass.range_constexpr(8):
             cute.copy(ca, sAp[None, None, kb], rAv[None, None, kb])
             cute.gemm(tm, acc, rA[None, None, kb], rB[None, None, kb], acc)

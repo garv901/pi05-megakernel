@@ -22,6 +22,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Uint32
 
+from . import fit_marks as FM
+
 ON = "iket" in os.environ.get("CUTE_DSL_COMPILER_OPT", "")
 CTA_STRIDE = int(os.environ.get("PI05_IKET_CTA_STRIDE", "1"))
 SYNC_RANGES = os.environ.get("PI05_IKET_SYNC", "1") != "0"
@@ -93,7 +95,10 @@ def sync_pop():
 
 @cute.jit
 def gmark(name: cutlass.Constexpr):
-    """Point marker (no range) inside gemm_phase; warp-uniform use is fine. Trace-time no-op unless PI05_IKET_GEMM=1."""
+    """Point marker (no range) inside gemm_phase; warp-uniform use is fine. Trace-time no-op unless PI05_IKET_GEMM=1
+    (or PI05_FIT, which records a FlashInfer-style entry instead, fit_marks.mark)."""
+    if cutlass.const_expr(FM.MODE):
+        FM.mark(1 + GEMM_NAMES.index(name))
     if cutlass.const_expr(GEMM):
         from cutlass.cute.experimental import iket
         if cutlass.const_expr(CTA_STRIDE > 1):
@@ -127,5 +132,5 @@ def gmark_dep(name: cutlass.Constexpr, rB, scratch_ptr):
 @cute.jit
 def gmark_loop(name: cutlass.Constexpr):
     """gmark inside the tile loop (g_mma, g_st, g_wnext); dropped with PI05_IKET_GEMM_LOOP=0."""
-    if cutlass.const_expr(GEMM and GEMM_LOOP):
+    if cutlass.const_expr((GEMM and GEMM_LOOP) or FM.MODE):
         gmark(name)

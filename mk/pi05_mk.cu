@@ -152,6 +152,11 @@ constexpr int NSSP = W / 64;  // sum-of-squares parts per row (64-column residua
 #ifndef PI05_LOAD_HOIST
 #define PI05_LOAD_HOIST 1
 #endif
+// Probe (MB2): gemm_phase / gemm_phase_wsplit take their (k chunk, slot) work assignment from block (blockIdx.x + ROT) %
+// gridDim.x instead of blockIdx.x, so a different SM runs each tile (same tiles, partial layout and order: bit-identical).
+#ifndef PI05_TILE_ROT
+#define PI05_TILE_ROT 0
+#endif
 // gemm_phase task order inside a K chunk: 0 = slot-major (ng = slot * NWARPS + warp: the first blocks' 8 warps take the first
 // tiles, so A's 640 tiles fill 80 SMs and 68 idle); 1 = warp-major (ng = warp * nblk + slot: every block's low warps first,
 // 4-5 busy warps on every SM). Same tiles, chunks and math (bit-identical); only the SM / warp that runs a tile changes.
@@ -230,6 +235,9 @@ struct Params {
 #ifdef PI05_PFTRACE
   unsigned long long* pf;   // probe: [step*layers+l][stream 0..3][block][warp][2] globaltimer at prefetch issue start / end
 #endif
+#ifdef PI05_FITRACE
+  unsigned long long* fit;  // probe: FlashInfer-style event buffer (after tstamp's 4096 slots), see FIT_OPEN
+#endif
 #if PI05_BARRIER
   unsigned int* bar;  // barrier flags / counter (BAR_WORDS), zeroed before the first cg barrier
 #endif
@@ -240,6 +248,60 @@ __device__ __forceinline__ unsigned long long globaltimer() {
   asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
   return t;
 }
+// Phase stamps (block 0, thread 0): globaltimer by default; dev-only PI05_TS_CLOCK64 = SM clock64 (cycles; ns/cycle must be
+// calibrated over a long span; a point globaltimer read right after a barrier is stale by 1-2 us).
+#ifdef PI05_TS_CLOCK64
+#define TS_NOW() ((unsigned long long)clock64())
+#else
+#define TS_NOW() globaltimer()
+#endif
+
+// Probe only: port of FlashInfer's intra-kernel profiler (include/flashinfer/profiler.cuh). Lane 0 of each warp
+// appends 64-bit entries {tag, globaltimer_lo} through a cursor; entry k of warp (block, w) sits at
+// fit[1 + k * grid * NWARPS + block * NWARPS + w], fit[0] = {nblocks, NWARPS}. Tag: bits 0-1 type (2 = instant),
+// 2-11 event (FIT_* below), 12-23 block * NWARPS + warp, 24-31 smid. Inside a function the cursor is a
+// register (FlashInfer's closure); between calls it lives in fit_cur. PI05_FITRACE=2 adds FlashInfer's
+// __threadfence_block() on both sides of every entry; 1 has none.
+#ifdef PI05_FITRACE
+constexpr int FIT_CAP = 32768;  // entries per warp the host buffer must hold (one chunk uses about 14k)
+enum { FIT_BAR = 0, FIT_G0, FIT_WISS, FIT_ADONE, FIT_SYNC, FIT_M0, FIT_MMA, FIT_ST, FIT_WNEXT, FIT_GEND };
+__shared__ unsigned long long* fit_cur[NWARPS];
+__device__ __forceinline__ unsigned fit_timer() {
+  unsigned t;
+  asm volatile("mov.u32 %0, %globaltimer_lo;" : "=r"(t));
+  return t;
+}
+__device__ __forceinline__ unsigned fit_tag_base() {
+  unsigned sm;
+  asm volatile("mov.u32 %0, %smid;" : "=r"(sm));
+  return (sm << 24) | ((blockIdx.x * NWARPS + (threadIdx.x >> 5)) << 12) | 2u;
+}
+#if PI05_FITRACE == 2
+#define FIT_FENCE() __threadfence_block()
+#else
+#define FIT_FENCE() do {} while (0)
+#endif
+#define FIT_OPEN()                                                     \
+  unsigned long long* fit_p = fit_cur[threadIdx.x >> 5];              \
+  const unsigned fit_tag = fit_tag_base(), fit_stride = gridDim.x * NWARPS
+#define FIT_EV(ev)                                                                                  \
+  do {                                                                                              \
+    FIT_FENCE();                                                                                    \
+    if (fit_p != nullptr && (threadIdx.x & 31) == 0) {                                              \
+      *fit_p = ((unsigned long long)fit_timer() << 32) | (fit_tag | ((unsigned)(ev) << 2));         \
+      fit_p += fit_stride;                                                                          \
+    }                                                                                               \
+    FIT_FENCE();                                                                                    \
+  } while (0)
+#define FIT_CLOSE() do { if ((threadIdx.x & 31) == 0) fit_cur[threadIdx.x >> 5] = fit_p; } while (0)
+// One entry through the shared cursor (outside an open function).
+#define FIT_KEV(ev) do { FIT_OPEN(); FIT_EV(ev); FIT_CLOSE(); } while (0)
+#else
+#define FIT_OPEN() do {} while (0)
+#define FIT_EV(ev) do {} while (0)
+#define FIT_CLOSE() do {} while (0)
+#define FIT_KEV(ev) do {} while (0)
+#endif
 
 // ---------------------------------------------------------------- helpers
 __device__ __forceinline__ float rbf(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
@@ -373,7 +435,7 @@ __device__ __forceinline__ void wpre_arrive(const WPre& w) {
 __device__ __forceinline__ void wpre_wait(const WPre& w) {
   if (threadIdx.x == 0) spin_acquire(w.bar, w.target);
   __syncthreads();
-  if (w.stamp != nullptr && threadIdx.x == 0) *w.stamp = globaltimer();
+  if (w.stamp != nullptr && threadIdx.x == 0) *w.stamp = TS_NOW();
 #ifdef PI05_PTRACE
   if (w.pt != nullptr && threadIdx.x == 0) w.pt[1] = globaltimer();
 #endif
@@ -477,7 +539,8 @@ __device__ __noinline__ void gemm_phase(const bf16* __restrict__ A, int K, const
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int g = lane >> 2, t4 = lane & 3;
   const int NG = N / 32, S = K / KC;
-  const int s = blockIdx.x % S, slot = blockIdx.x / S;
+  const int vblk = PI05_TILE_ROT ? (blockIdx.x + PI05_TILE_ROT) % gridDim.x : blockIdx.x;
+  const int s = vblk % S, slot = vblk / S;
   const int nblk = (gridDim.x - s + S - 1) / S;  // blocks sharing chunk s
   const int k0 = s * KC;
   const uint4 zero = make_uint4(0, 0, 0, 0);
@@ -499,14 +562,21 @@ __device__ __noinline__ void gemm_phase(const bf16* __restrict__ A, int K, const
   };
 
   uint4 b[4][4];
+  FIT_OPEN();
+  FIT_EV(FIT_G0);
 #if PI05_WPRE
   if (wp.bar != nullptr) {
     wpre_arrive(wp);
     if (ng < NG) load_w(ng, b);
+    FIT_EV(FIT_WISS);
     wpre_wait(wp);
+    FIT_EV(FIT_BAR);
   } else
 #endif
-  if (ng < NG) load_w(ng, b);
+  {
+    if (ng < NG) load_w(ng, b);
+    FIT_EV(FIT_WISS);
+  }
   // Stage A[0:50, k0:k0+128] (rows 50..63 zero).
   // Norm mode (ssp != null): A is the residual h and the staged tile is its adaRMS
   // norm, rs[r] from the 8 per-chunk sums of squares ssp[r][0..7] (fixed order, as
@@ -605,7 +675,9 @@ __device__ __noinline__ void gemm_phase(const bf16* __restrict__ A, int K, const
     }
 #endif
   }
+  FIT_EV(FIT_ADONE);
   __syncthreads();
+  FIT_EV(FIT_SYNC);
   for (; ng < NG; ng += ng_step) {
     float acc[4][4][4];
 #pragma unroll
@@ -626,6 +698,7 @@ __device__ __noinline__ void gemm_phase(const bf16* __restrict__ A, int K, const
           mma16816(acc[mt][nt], x0.x, x0.y, x0.z, x0.w, b[sl][nt].x, b[sl][nt].y);
           mma16816(acc[mt][nt], x1.x, x1.y, x1.z, x1.w, b[sl][nt].z, b[sl][nt].w);
         }
+        if (sl == 0 && mt == 0) FIT_EV(FIT_M0);  // after the first 8 MMAs: the sl = 0 weights have arrived
 #else
         const uint4 a0 = lds128(As + (mt * 16 + g) * AS_STRIDE + sl * 32 + t4 * 8);
         const uint4 a1 = lds128(As + (mt * 16 + g + 8) * AS_STRIDE + sl * 32 + t4 * 8);
@@ -634,12 +707,17 @@ __device__ __noinline__ void gemm_phase(const bf16* __restrict__ A, int K, const
           mma16816(acc[mt][nt], a0.x, a1.x, a0.y, a1.y, b[sl][nt].x, b[sl][nt].y);
           mma16816(acc[mt][nt], a0.z, a1.z, a0.w, a1.w, b[sl][nt].z, b[sl][nt].w);
         }
+        if (sl == 0 && mt == 0) FIT_EV(FIT_M0);  // after the first 8 MMAs: the sl = 0 weights have arrived
 #endif
       }
     }
+    FIT_EV(FIT_MMA);
     const int n0 = ng * 32;
 #if PI05_LOAD_HOIST
-    if (ng + ng_step < NG) load_w(ng + ng_step, b);
+    if (ng + ng_step < NG) {
+      load_w(ng + ng_step, b);
+      FIT_EV(FIT_WNEXT);
+    }
 #endif
 #pragma unroll
     for (int mt = 0; mt < 4; ++mt)
@@ -657,14 +735,20 @@ __device__ __noinline__ void gemm_phase(const bf16* __restrict__ A, int K, const
               make_float2(acc[mt][nt][2], acc[mt][nt][3]);
 #endif
       }
+    FIT_EV(FIT_ST);
 #if !PI05_LOAD_HOIST
-    if (ng + ng_step < NG) load_w(ng + ng_step, b);
+    if (ng + ng_step < NG) {
+      load_w(ng + ng_step, b);
+      FIT_EV(FIT_WNEXT);
+    }
 #endif
     if (cnt != nullptr) {  // publish this 32-column partial tile (fence overlaps the next loads)
       __syncwarp();
       if (lane == 0) red_release(cnt + ((n0 / cdiv) % cmod) * CNT_STRIDE);
     }
   }
+  FIT_EV(FIT_GEND);
+  FIT_CLOSE();
 }
 
 // Phase D (o_proj) only fills about half the grid: 32 32-column tasks per K chunk against
@@ -687,7 +771,8 @@ __device__ __noinline__ void gemm_phase_wsplit(const bf16* __restrict__ A, int K
   const int g = lane >> 2, t4 = lane & 3;
   const int gi = warp / WPT, wi = warp % WPT;
   const int NG = N / 32, S = K / KC;
-  const int s = blockIdx.x % S, slot = blockIdx.x / S;
+  const int vblk = PI05_TILE_ROT ? (blockIdx.x + PI05_TILE_ROT) % gridDim.x : blockIdx.x;
+  const int s = vblk % S, slot = vblk / S;
   const int nblk = (gridDim.x - s + S - 1) / S;
   const int k0 = s * KC;
   const uint4 zero = make_uint4(0, 0, 0, 0);
@@ -713,6 +798,7 @@ __device__ __noinline__ void gemm_phase_wsplit(const bf16* __restrict__ A, int K
     wpre_arrive(wp);  // the weight buffers are free after the CTA sync (C / C3 are done in this block)
     if (ng < NG) load_w(ng);
     wpre_wait(wp);
+    FIT_KEV(FIT_BAR);
   } else
 #endif
   if (ng < NG) load_w(ng);
@@ -1161,7 +1247,13 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
   __shared__ int s_valid;
   cg::grid_group grid = cg::this_grid();
   int tcount = 1;
-  if (p.tstamp != nullptr && blockIdx.x == 0 && threadIdx.x == 0) p.tstamp[0] = globaltimer();
+  if (p.tstamp != nullptr && blockIdx.x == 0 && threadIdx.x == 0) p.tstamp[0] = TS_NOW();
+#ifdef PI05_FITRACE
+  if ((threadIdx.x & 31) == 0)
+    fit_cur[threadIdx.x >> 5] = p.fit != nullptr ? p.fit + 1 + blockIdx.x * NWARPS + (threadIdx.x >> 5) : nullptr;
+  if (p.fit != nullptr && blockIdx.x == 0 && threadIdx.x == 0) p.fit[0] = ((unsigned long long)NWARPS << 32) | gridDim.x;
+  __syncwarp();
+#endif
 #ifdef PI05_PTRACE
 #define PT_A() do { __syncthreads(); if (p.ptr != nullptr && threadIdx.x == 0) \
     p.ptr[((size_t)tcount * gridDim.x + blockIdx.x) * 2] = globaltimer(); } while (0)
@@ -1188,7 +1280,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
     grid.sync();                                                                   \
     PT_E();                                                                        \
     if (p.tstamp != nullptr && blockIdx.x == 0 && threadIdx.x == 0 && tcount < p.tmax) \
-      p.tstamp[tcount] = globaltimer();                                            \
+      p.tstamp[tcount] = TS_NOW();                                            \
+    FIT_KEV(FIT_BAR);                                                              \
     ++tcount;                                                                      \
   } while (0)
 #define SYNC()                                                                     \
@@ -1197,7 +1290,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
     grid_barrier(p.bar, ++bar_epoch);                                              \
     PT_E();                                                                        \
     if (p.tstamp != nullptr && blockIdx.x == 0 && threadIdx.x == 0 && tcount < p.tmax) \
-      p.tstamp[tcount] = globaltimer();                                            \
+      p.tstamp[tcount] = TS_NOW();                                            \
+    FIT_KEV(FIT_BAR);                                                              \
     ++tcount;                                                                      \
   } while (0)
   if (threadIdx.x == 0) {
@@ -1224,7 +1318,8 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
     grid.sync();                                                                   \
     PT_E();                                                                        \
     if (p.tstamp != nullptr && blockIdx.x == 0 && threadIdx.x == 0 && tcount < p.tmax) \
-      p.tstamp[tcount] = globaltimer();                                            \
+      p.tstamp[tcount] = TS_NOW();                                            \
+    FIT_KEV(FIT_BAR);                                                              \
     ++tcount;                                                                      \
   } while (0)
 #define SYNC0() SYNC()
@@ -2087,6 +2182,11 @@ void launch(std::vector<torch::Tensor> in, torch::Tensor actions, torch::Tensor 
     const int64_t pf_n = (int64_t)n_steps * n_layers * 4 * g_grid * NWARPS * 2;
     p.pf = tstamp.numel() >= pf_off + pf_n ? p.tstamp + pf_off : nullptr;
   }
+#endif
+#ifdef PI05_FITRACE
+  // fit[0] header + FIT_CAP entries per warp (the trace has no bound check, as FlashInfer's: size the buffer).
+  p.fit = tstamp.numel() >= 4096 + 1 + (int64_t)FIT_CAP * g_grid * NWARPS ? p.tstamp + 4096 : nullptr;
+  if (p.fit != nullptr) p.tmax = 4096;
 #endif
 #ifdef PI05_CSTAMP
   p.cst = tstamp.numel() >= 4096 + (int64_t)n_steps * n_layers * g_grid * CST_N ? p.tstamp + 4096 : nullptr;

@@ -15,3 +15,6 @@ __pycache__/
 probe/ubench/sync_cost
 probe/ubench/chain_pdl
 probe/ubench/hbm_ramp
+probe/ubench/gemm_task
+probe/ubench/gemm_tc
+probe/ubench/gemm_tc2

@@ -15,6 +15,7 @@ from cutlass.cute.nvgpu import CopyUniversalOp
 from . import mathx as X
 from . import rowops as R
 from . import sync as S
+from . import fit_marks as FM
 from . import iket_marks as IM
 from .config import (ADIM, ARR_QKV, CNT_QKV, CNT_STRIDE, FF, FUSE_AB, FUSE_ABL, FUSE_BACKOFF, FUSE_DEFNORM, HD, KVD, L, MODROW, NQKV,
                      NSSP, NSTEP, NTHREADS, QD, T, W, Knobs, workspace_layout)
@@ -286,6 +287,8 @@ def pi05_megakernel(action_in_weight: cute.Tensor, action_in_bias: cute.Tensor, 
     gthreads = nb * NTHREADS
     P = knobs.prefix
     v = ws_views(ws, knobs)
+    if cutlass.const_expr(FM.MODE):  # PI05_FIT probe: per-warp cursors into the workspace `fit` region
+        FM.init(ws.iterator.toint() + workspace_layout(knobs)["fit"][0])
     alloc = cutlass.utils.SmemAllocator()
     red = cute.make_tensor(alloc.allocate_array(Float32, 8), cute.make_layout(8))
     s_valid = cute.make_tensor(alloc.allocate_array(Int32, 1), cute.make_layout(1))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from . import fit_marks as FM
 from . import iket_marks as IM
 
 T = 50
@@ -49,6 +50,9 @@ AS_STRIDE = KC + 32
 WS_STRIDE = 40
 NUM_SMS = 148
 GEMM_SCRATCH = (NWARPS * 4 + 15) // 16 * 16 if IM.GEMM else 0  # PI05_IKET_GEMM=1: one u32 per warp (gmark_dep) after all other smem
+FIT_SCRATCH = FM.SCRATCH_BYTES  # PI05_FIT: one u64 cursor per warp at the very end of the dynamic smem
+if FM.MODE and IM.GEMM:
+    raise ValueError("PI05_FIT and PI05_IKET_GEMM are exclusive")
 
 LAYOUT_ORDER = ("temb", "tmid", "cond", "mod", "xbuf", "rope", "h", "xn", "part", "q", "ksuf", "vsuf",
                 "scores", "stats", "opart", "attn", "act", "cnt", "ssp", "bar")
@@ -108,7 +112,7 @@ class Knobs:
         base = max(c1, c2, NSTEP * W * 4)
         if self.fuse & FUSE_ABL:
             base = max(base, 8 * 64 * KC * 2)  # FUSE_ABL: 8 private A tiles (the fp32 partial buffer reuses them)
-        return base + GEMM_SCRATCH
+        return base + GEMM_SCRATCH + FIT_SCRATCH
 
 
 def _align(x: int) -> int:
@@ -131,5 +135,8 @@ def workspace_layout(k: Knobs) -> dict[str, tuple[int, int]]:
     for name in LAYOUT_ORDER:
         out[name] = (off, sizes[name])
         off = _align(off + sizes[name])
+    if FM.MODE:  # PI05_FIT: trace region after every buffer (probe only)
+        out["fit"] = (off, FM.REGION_BYTES)
+        off = _align(off + FM.REGION_BYTES)
     out["total"] = (0, off)
     return out
