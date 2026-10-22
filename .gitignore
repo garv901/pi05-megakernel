@@ -20,3 +20,5 @@ probe/ubench/gemm_tc
 probe/ubench/gemm_tc2
 probe/ubench/fg/*
 !probe/ubench/fg/*.*
+probe/ubench/att/*
+!probe/ubench/att/*.*

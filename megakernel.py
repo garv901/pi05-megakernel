@@ -31,16 +31,17 @@ def parse_variant(variant: str) -> dict:
     ``lh`` = Knobs.load_hoist 1 (CuTe: gemm_phase next-tile weight load hoisted above the partial stores), ``nolh`` = CUDA
     built with PI05_LOAD_HOIST=0 (not with lh), ``nosp`` = CUDA built with PI05_GEMM_SPREAD=0 (slot-major gemm_phase tasks),
     ``nopb`` = CUDA built with PI05_PART_BF16=0 (fp32 split-K partials, the pre-job-8802 build).
-    ``fgu`` = CUDA built with PI05_FG_UMMA=1 (tcgen05 cta_group::2 F+G, cooperative cluster-2 launch, sm_100a). CUDA arm only:
-    the CuTe arm ignores it (cute/ is untouched).
+    ``fgu`` = CUDA built with PI05_FG_UMMA=1 (tcgen05 cta_group::2 F+G, cooperative cluster-2 launch, sm_100a), ``att`` = CUDA built with
+    PI05_ATT_K2=1 (K2 attention: TMA + mma.sync, 143 units; PI05_PREFIX 968 only); both together (``k64-fgu-att``) is the target build. CUDA arm only:
+    the CuTe arm ignores them (cute/ is untouched).
     The CUDA kernel also uses bf16 partials by default (PI05_PART_BF16 default 1), so ``k64-nopb`` is that A/B control.
     The CUDA kernel hoists and spreads by default (both macros default 1), so for the CUDA arm ``k64`` and ``k64-lh`` are the
     same build and ``k64-nolh`` / ``k64-nosp`` are the A/B controls. The CuTe arm reads att_keys and load_hoist only.
     E.g. ``k64-nosp``. Shared by the CUDA and CuTe arms so they cannot drift."""
     keys, *suffixes = variant.split("-")
     if not keys.startswith("k") or not keys[1:].isdigit():
-        raise ValueError(f"bad variant {variant!r}: expected k<att_keys>[-lh|-nolh][-nosp][-nopb][-fgu]")
-    out = {"att_keys": int(keys[1:]), "load_hoist": 0, "hoist_off": False, "spread_off": False, "part_bf16_off": False, "fgu": False}
+        raise ValueError(f"bad variant {variant!r}: expected k<att_keys>[-lh|-nolh][-nosp][-nopb][-fgu][-att]")
+    out = {"att_keys": int(keys[1:]), "load_hoist": 0, "hoist_off": False, "spread_off": False, "part_bf16_off": False, "fgu": False, "att_k2": False}
     if len(set(suffixes)) != len(suffixes):
         raise ValueError(f"duplicate variant suffix in {variant!r}")
     if "lh" in suffixes and "nolh" in suffixes:
@@ -56,8 +57,10 @@ def parse_variant(variant: str) -> dict:
             out["part_bf16_off"] = True
         elif suffix == "fgu":
             out["fgu"] = True
+        elif suffix == "att":
+            out["att_k2"] = True
         else:
-            raise ValueError(f"bad variant suffix {suffix!r} in {variant!r}: expected lh, nolh, nosp, nopb or fgu")
+            raise ValueError(f"bad variant suffix {suffix!r} in {variant!r}: expected lh, nolh, nosp, nopb, fgu or att")
     return out
 
 
@@ -116,9 +119,11 @@ class MegakernelArm:
         self.part_bf16 = not pv["part_bf16_off"]
         if not self.part_bf16 and "-DPI05_PART_BF16=0" not in extra:  # the plain build uses bf16 partials (PI05_PART_BF16 default 1)
             extra = (*extra, "-DPI05_PART_BF16=0")
-        self.fgu = pv["fgu"]
+        self.fgu, self.att_k2 = pv["fgu"], pv["att_k2"]
         if self.fgu and "-DPI05_FG_UMMA=1" not in extra:
             extra = (*extra, "-DPI05_FG_UMMA=1")
+        if self.att_k2 and "-DPI05_ATT_K2=1" not in extra:
+            extra = (*extra, "-DPI05_ATT_K2=1")
         self.geo = geo
         self.ext = load(geo.prefix, self.att_keys, extra)
         self.device = torch.device(device)
@@ -131,7 +136,7 @@ class MegakernelArm:
         self.actions = torch.empty((geo.horizon, geo.action_dim), dtype=torch.float32,
                                    device=self.device)
         self.tensors: list[torch.Tensor] | None = None
-        self.config = {"att_keys": self.att_keys, "load_hoist": self.load_hoist, "spread": int(self.spread), "part_bf16": int(self.part_bf16), "fg_umma": int(self.fgu), "fuse": self.fuse, "prefix": geo.prefix,
+        self.config = {"att_keys": self.att_keys, "load_hoist": self.load_hoist, "spread": int(self.spread), "part_bf16": int(self.part_bf16), "fg_umma": int(self.fgu), "att_k2": int(self.att_k2), "fuse": self.fuse, "prefix": geo.prefix,
                        "launches_per_chunk": 1}
 
     def bind(self, inputs: dict) -> None:

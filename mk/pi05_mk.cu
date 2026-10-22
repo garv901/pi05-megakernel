@@ -39,6 +39,9 @@ constexpr int P = PI05_PREFIX;  // prefix length
 // no FUSE_FG, PI05_WPRE bit 2, PI05_PART_BF16). E writes the activation tile A' for the TMA; the F->G grid barrier and G's reduce loop are gone.
 // Per layer that is one barrier fewer: later bar_epoch values shift by one per layer; the stamp slot (tcount) of the removed barrier is kept (block 0
 // stamps it with the time F returned), so slot numbering is unchanged but slot 6 now ends at F's exit and the "G" phase is the next-layer prefetch only.
+// PI05_NULL_ATT (dev-only, ground truth for the attention phase study): phase C (K/V/Q loads, QK^T, softmax, PV, stats / opart stores) and the
+// C3 combine's loads, math and attn store are skipped, as is the pre-B K/V prefill. Every barrier, every unit's counter release (so the C3 waits still
+// pass), C3's counter wait, the L2 prefetches (Wo, prefix K/V, Wg/Wu) and every stamp slot are kept. L0 = event time (default - NULL_ATT) / 180.
 // PI05_NULL_FG with PI05_FG_UMMA: E (including A' stores) and the E->F split barrier are kept, F's TMA / MMA / epilogue are skipped, and so is the
 // F->G barrier: the L0 event difference (umma - umma-NULL_FG) is the in-situ cost of F + G for this build. Dev-only PI05_SMEM_PAD: default build with
 // the dynamic smem raised to the FG_UMMA footprint (isolates the L1-carveout cost of the larger smem).
@@ -99,14 +102,49 @@ constexpr size_t SMEM_C1 = (size_t)ATT_KEYS * KS_STRIDE * 2 + (size_t)ATT_ROWS *
 // gemm_phase_wsplit<2> footprint (A tile + partials + weights; asserted there).
 constexpr size_t SMEM_C2 = (size_t)64 * (KC + 32) * 2 + (size_t)NWARPS * T * 40 * 4 + (size_t)NWARPS * 2 * 4 * 32 * 16;
 constexpr size_t SMEM_T = (size_t)NSTEP * W * 4;
-#if !(PI05_FG_UMMA || defined(PI05_SMEM_PAD))
+// PI05_ATT_K2 (default 0): attention phase C + C3 on the K2 decomposition (port of probe/ubench/att/att_k2.cu variant k2_tma; same mma.sync m16n8k16 math as the
+// default). Unit = (32 query rows, key chunk): 13 row groups x 11 chunks (10 prefix chunks of 96 keys + a tail chunk of 64 = prefix keys 960..967, the 50 suffix keys,
+// 6 pad) = 143 units on CTAs 0..142 (blk -> rg = blk % 13, chunk = 10 - blk / 13: the tail units sit on the lowest blocks, the B tasks run on the highest ones). QK^T warp
+// tiling is not redundant, the softmax is fused in registers, K / V / q arrive by TMA (SWIZZLE_128B tiles, 7 tensor maps passed as a __grid_constant__ AttMaps
+// parameter, encoded host-side): the prefix K / V of the unit's chunk are issued in phase B (before the B -> C barrier, replacing PI05_ATT_PREFILL), q and the
+// tail's suffix rows after it. Partials stay fp32 (opart[chunk][row][256], XOR-permuted float4 chunks; stats[row][chunk] = (m, l)); every unit releases its row group's
+// counter (11 arrivals per layer) and the same CTA then combines 3 rows (rows k = chunk + 11 s of its row group) once the row group is complete. Needs the counter
+// handoff (FUSE_CC3) and PI05_PREFIX = 968; works with or without PI05_FG_UMMA (no cluster / tcgen05 requirement). PI05_NULL_ATT keeps the TMA-free skeleton:
+// unit releases, combine's counter wait. The B -> C barrier orders the generic-proxy writes of q / ksuf / vsuf for the TMA (fence.proxy.async.global by the writers after
+// their B tasks and by the issuing thread before the q TMA).
+#ifndef PI05_ATT_K2
+#define PI05_ATT_K2 0
+#endif
+#if PI05_ATT_K2
+constexpr int AK_R = 32, AK_NRG = (QROWS + AK_R - 1) / AK_R;  // 13
+constexpr int AK_KP = 96, AK_NPC = 10, AK_NCH = AK_NPC + 1, AK_KT = 64;
+constexpr int AK_NUNIT = AK_NRG * AK_NCH;                    // 143
+static_assert(P == 968 && AK_NPC * AK_KP + 8 == P, "PI05_ATT_K2 is specialized for PI05_PREFIX = 968");
+static_assert(NTHREADS == 256 && HD == 256 && QROWS == 400, "PI05_ATT_K2 tile geometry");
+constexpr int AK_SS = AK_KP + 8;                             // S / P tile row stride (elements)
+constexpr int AK_KBLK = AK_KP * 128, AK_QBLK = AK_R * 128;   // bytes of one 64-column block of a K / V / Q tile
+// smem map (bytes from the 1024-aligned base)
+constexpr uint32_t AK_OFF_K = 0, AK_OFF_V = 4 * AK_KP * 128, AK_OFF_Q = AK_OFF_V + 4 * AK_KP * 128, AK_OFF_S = AK_OFF_Q + 4 * AK_R * 128;
+constexpr uint32_t AK_OFF_MK = AK_OFF_S + AK_R * AK_SS * 2, AK_OFF_BAR = AK_OFF_MK + 128, AK_OFF_X = AK_OFF_BAR + 64, AK_OFF_END = AK_OFF_X + 1024;
+constexpr size_t SMEM_K2 = AK_OFF_END + 1024;                // + alignment slack of the 1024-aligned base
+#endif
+#if !(PI05_FG_UMMA || defined(PI05_SMEM_PAD) || PI05_ATT_K2)
 constexpr size_t SMEM_BYTES = SMEM_C1 > SMEM_C2 ? (SMEM_C1 > SMEM_T ? SMEM_C1 : SMEM_T)
                                                 : (SMEM_C2 > SMEM_T ? SMEM_C2 : SMEM_T);
 #else
 constexpr size_t SMEM_FGU = (size_t)16 * 4096 + 131072 + 1024;  // tcgen05 F: B tile + whole weight tile + alignment slack
 constexpr size_t SMEM_BYTES0 = SMEM_C1 > SMEM_C2 ? (SMEM_C1 > SMEM_T ? SMEM_C1 : SMEM_T)
                                                  : (SMEM_C2 > SMEM_T ? SMEM_C2 : SMEM_T);
-constexpr size_t SMEM_BYTES = SMEM_BYTES0 > SMEM_FGU ? SMEM_BYTES0 : SMEM_FGU;
+#if PI05_FG_UMMA || defined(PI05_SMEM_PAD)
+constexpr size_t SMEM_BYTES1 = SMEM_BYTES0 > SMEM_FGU ? SMEM_BYTES0 : SMEM_FGU;
+#else
+constexpr size_t SMEM_BYTES1 = SMEM_BYTES0;  // PI05_ATT_K2 alone: the default footprint, raised below for the K2 tiles
+#endif
+#if PI05_ATT_K2
+constexpr size_t SMEM_BYTES = SMEM_BYTES1 > SMEM_K2 ? SMEM_BYTES1 : SMEM_K2;
+#else
+constexpr size_t SMEM_BYTES = SMEM_BYTES1;
+#endif
 #endif
 
 // Arrival counters replacing the reduce/combine grid barriers. Producers
@@ -121,6 +159,9 @@ constexpr unsigned ARR_QKV = (HD / 32) * (W / KC);
 constexpr unsigned ARR_ATT = ATT_NCHUNK;
 constexpr unsigned ARR_GU = 2 * (W / KC);
 constexpr int FUSE_AB = 1, FUSE_CC3 = 2, FUSE_FG = 4, FUSE_BACKOFF = 8;
+#if PI05_ATT_K2
+static_assert(AK_NUNIT <= 148 && AK_NRG <= CNT_GU - CNT_ATT, "PI05_ATT_K2 units / counters");
+#endif
 // Non-final residuals run as grid-parallel (row, column group) tasks and the next
 // GEMM normalizes h while staging A (no xn, no row-local block_sum).
 constexpr int FUSE_DEFNORM = 16;
@@ -1471,8 +1512,281 @@ __device__ __noinline__ void fg_F(const Params& p, const CUtensorMap* tmW, const
 }
 #endif  // PI05_FG_UMMA
 
+#if PI05_ATT_K2
+// ------------------------------------------------------------- PI05_ATT_K2: attention units (TMA + mma.sync) and the owner-sliced combine
+// Port of probe/ubench/att/att_k2.cu (variant k2_tma). Everything below is __noinline__ with by-value / pointer arguments only (no reference into the kernel frame).
+#include <cuda.h>
+struct alignas(64) AttMaps {
+  CUtensorMap k, v;      // prefix K / V {HD, L * P}, box {64, 96}, SW128
+  CUtensorMap k8, v8;    // same tensors, box {64, 8}: prefix keys 960..967 of the tail unit
+  CUtensorMap ks, vs;    // suffix K / V {HD, T}, box {64, 56} (rows >= T zero-filled by the TMA)
+  CUtensorMap q;         // q {HD, QROWS}, box {64, 32} (rows >= QROWS zero-filled)
+};
+__device__ unsigned g_ak_to;  // mbarrier wait timeouts (host reads through att_timeouts())
+
+__device__ __forceinline__ uint32_t ak_su32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+__device__ __forceinline__ void ak_mbar_init(uint32_t b, int n) { asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(b), "r"(n)); }
+__device__ __forceinline__ void ak_mbar_expect(uint32_t b, uint32_t bytes) { asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(b), "r"(bytes) : "memory"); }
+__device__ __forceinline__ void ak_mbar_wait(uint32_t b, uint32_t par) {
+  uint32_t ok = 0;
+  for (unsigned long long i = 0; i < (1ull << 22) && !ok; ++i)
+    asm volatile("{\n.reg .pred P;\nmbarrier.try_wait.parity.shared::cta.b64 P, [%1], %2;\nselp.u32 %0, 1, 0, P;\n}" : "=r"(ok) : "r"(b), "r"(par) : "memory");
+  if (!ok) atomicAdd(&g_ak_to, 1u);
+}
+__device__ __forceinline__ void ak_tma2d(uint32_t dst, unsigned long long map, uint32_t bar, int c0, int c1) {
+  asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4}], [%2];"
+               ::"r"(dst), "l"(map), "r"(bar), "r"(c0), "r"(c1) : "memory"); }
+__device__ __forceinline__ void ak_ldsm_x2(uint32_t& r0, uint32_t& r1, uint32_t a) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r0), "=r"(r1) : "r"(a)); }
+__device__ __forceinline__ void ak_ldsm_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, uint32_t a) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a)); }
+__device__ __forceinline__ void ak_ldsm_x4t(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, uint32_t a) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a)); }
+__device__ __forceinline__ unsigned char* ak_base(void* smb) {  // 1024-aligned base inside the dynamic smem
+  const uint32_t s = ak_su32(smb);
+  return reinterpret_cast<unsigned char*>(smb) + (((s + 1023u) & ~1023u) - s);
+}
+
+// by-value argument block of the noinline functions: plain pointers / integers only (maps = generic address of the AttMaps kernel parameter)
+struct AkArgs {
+  const uint8_t* mask; bf16* attn; float *stats, *opart; unsigned* cnt; unsigned char* smem; unsigned long long maps; int backoff;
+};
+constexpr int AK_MAP_K = 0, AK_MAP_V = 1, AK_MAP_K8 = 2, AK_MAP_V8 = 3, AK_MAP_KS = 4, AK_MAP_VS = 5, AK_MAP_Q = 6;
+__device__ __forceinline__ unsigned long long ak_map(unsigned long long maps, int i) { return maps + (unsigned long long)i * sizeof(CUtensorMap); }
+__device__ __forceinline__ void ak_map_of(int blk, int& rg, int& kc) { rg = blk % AK_NRG; kc = AK_NCH - 1 - blk / AK_NRG; }
+
+// phase B hook: init the unit's mbarriers and issue the prefix K / V TMA of its chunk (nothing here depends on B's outputs)
+__device__ __noinline__ void ak_pre(AkArgs a, int l) {
+  if (blockIdx.x >= AK_NUNIT) return;
+  int rg, kc; ak_map_of(blockIdx.x, rg, kc);
+  const bool tail = kc == AK_NCH - 1;
+  const uint32_t sb = ak_su32(a.smem);
+  __syncthreads();  // every warp is done with the previous phase's use of the smem
+  if (threadIdx.x == 0) {
+    const int cnt = tail ? 2 : 1;  // tail: prefix part + suffix part each arrive with their expect_tx
+    ak_mbar_init(sb + AK_OFF_BAR, cnt); ak_mbar_init(sb + AK_OFF_BAR + 8, cnt); ak_mbar_init(sb + AK_OFF_BAR + 16, 1);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // earlier phases used this smem through the generic proxy
+    const int rows = tail ? 8 : AK_KP, j0 = kc * AK_KP;
+    const uint32_t bK = sb + AK_OFF_BAR, bV = bK + 8;
+    ak_mbar_expect(bK, 4 * rows * 128); ak_mbar_expect(bV, 4 * rows * 128);
+#pragma unroll
+    for (int cb = 0; cb < 4; ++cb) {
+      ak_tma2d(sb + AK_OFF_K + cb * AK_KBLK, ak_map(a.maps, tail ? AK_MAP_K8 : AK_MAP_K), bK, cb * 64, l * P + j0);
+      ak_tma2d(sb + AK_OFF_V + cb * AK_KBLK, ak_map(a.maps, tail ? AK_MAP_V8 : AK_MAP_V), bV, cb * 64, l * P + j0);
+    }
+    asm volatile("prefetch.tensormap [%0];" ::"l"(ak_map(a.maps, AK_MAP_Q)) : "memory");  // warm the descriptors used after the barrier
+    if (tail) { asm volatile("prefetch.tensormap [%0];" ::"l"(ak_map(a.maps, AK_MAP_KS)) : "memory"); asm volatile("prefetch.tensormap [%0];" ::"l"(ak_map(a.maps, AK_MAP_VS)) : "memory"); }
+  }
+}
+
+// QK^T for warp (mt = w & 1, kg = w >> 1): 16 rows x NTW n-tiles, scaled / masked, fused softmax (row max over the quad and the 4 key-group warps, p = bf16(exp(s - m)) -> S (bf16))
+template <int NTW>
+__device__ __forceinline__ void ak_qk(uint32_t sb, const uint8_t* Mk, float* smx, int warp, int lane) {
+  const int mt = warp & 1, kg = warp >> 1, g = lane >> 2, t4 = lane & 3, x = lane & 7;
+  float sc[NTW][4];
+#pragma unroll
+  for (int n = 0; n < NTW; ++n)
+#pragma unroll
+    for (int e = 0; e < 4; ++e) sc[n][e] = 0.f;
+  const uint32_t aBase = sb + AK_OFF_Q + (mt * 16 + x + ((lane >> 3) & 1) * 8) * 128;
+  const uint32_t kBase = sb + AK_OFF_K;
+  const int bn0 = kg * NTW;
+#pragma unroll
+  for (int kk = 0; kk < HD / 16; ++kk) {
+    uint32_t a0, a1, a2, a3;
+    ak_ldsm_x4(a0, a1, a2, a3, aBase + (kk >> 2) * AK_QBLK + (((((kk & 3) * 2 + (lane >> 4)) ^ x) & 7) << 4));
+#pragma unroll
+    for (int np = 0; np < NTW / 2; ++np) {
+      const int krow = (bn0 + 2 * np) * 8 + (lane >> 4) * 8 + x;
+      uint32_t b0, b1, b2, b3;
+      ak_ldsm_x4(b0, b1, b2, b3, kBase + (kk >> 2) * AK_KBLK + krow * 128 + (((((kk & 3) * 2 + ((lane >> 3) & 1)) ^ x) & 7) << 4));
+      mma16816(sc[2 * np], a0, a1, a2, a3, b0, b1);
+      mma16816(sc[2 * np + 1], a0, a1, a2, a3, b2, b3);
+    }
+    if (NTW & 1) {
+      const int krow = (bn0 + NTW - 1) * 8 + x;
+      uint32_t b0, b1;
+      ak_ldsm_x2(b0, b1, kBase + (kk >> 2) * AK_KBLK + krow * 128 + (((((kk & 3) * 2 + ((lane >> 3) & 1)) ^ x) & 7) << 4));
+      mma16816(sc[NTW - 1], a0, a1, a2, a3, b0, b1);
+    }
+  }
+  float* xm = reinterpret_cast<float*>(smx);
+  float* xs = xm + 4 * AK_R;
+  float v[NTW][4];
+  float lm[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+  for (int n = 0; n < NTW; ++n) {
+    const int col = (bn0 + n) * 8 + 2 * t4;
+#pragma unroll
+    for (int e = 0; e < 4; ++e) { v[n][e] = Mk[col + (e & 1)] ? rbf(sc[n][e]) * 0.0625f : -INFINITY; lm[e >> 1] = fmaxf(lm[e >> 1], v[n][e]); }
+  }
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    lm[h] = fmaxf(lm[h], __shfl_xor_sync(0xffffffffu, lm[h], 1));
+    lm[h] = fmaxf(lm[h], __shfl_xor_sync(0xffffffffu, lm[h], 2));
+  }
+  const int ra = mt * 16 + g, rb = ra + 8;
+  if (t4 == 0) { xm[kg * AK_R + ra] = lm[0]; xm[kg * AK_R + rb] = lm[1]; }
+  __syncthreads();
+  float mr[2];
+  mr[0] = fmaxf(fmaxf(xm[ra], xm[AK_R + ra]), fmaxf(xm[2 * AK_R + ra], xm[3 * AK_R + ra]));
+  mr[1] = fmaxf(fmaxf(xm[rb], xm[AK_R + rb]), fmaxf(xm[2 * AK_R + rb], xm[3 * AK_R + rb]));
+  const float ms[2] = {mr[0] == -INFINITY ? 0.f : mr[0], mr[1] == -INFINITY ? 0.f : mr[1]};
+  float ls[2] = {0.f, 0.f};
+#pragma unroll
+  for (int n = 0; n < NTW; ++n) {
+    const int col = (bn0 + n) * 8 + 2 * t4;
+    float pr[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) { pr[e] = rbf(expf(v[n][e] - ms[e >> 1])); ls[e >> 1] += pr[e]; }
+    const __nv_bfloat162 lo = __floats2bfloat162_rn(pr[0], pr[1]), hi = __floats2bfloat162_rn(pr[2], pr[3]);
+    asm volatile("st.shared.b32 [%0], %1;" ::"r"(sb + AK_OFF_S + (ra * AK_SS + col) * 2), "r"(*reinterpret_cast<const uint32_t*>(&lo)) : "memory");
+    asm volatile("st.shared.b32 [%0], %1;" ::"r"(sb + AK_OFF_S + (rb * AK_SS + col) * 2), "r"(*reinterpret_cast<const uint32_t*>(&hi)) : "memory");
+  }
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    ls[h] += __shfl_xor_sync(0xffffffffu, ls[h], 1);
+    ls[h] += __shfl_xor_sync(0xffffffffu, ls[h], 2);
+  }
+  if (t4 == 0) { xs[kg * AK_R + ra] = ls[0]; xs[kg * AK_R + rb] = ls[1]; }
+}
+
+// one unit: q (and the tail's suffix K / V) TMA after the B -> C barrier, QK^T + softmax, P.V, partial O + stats, counter release
+__device__ __noinline__ void ak_unit(AkArgs a, int l) {
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t4 = lane & 3, x = lane & 7;
+  if (blockIdx.x >= AK_NUNIT) return;
+  int rg, kc; ak_map_of(blockIdx.x, rg, kc);
+  const bool tail = kc == AK_NCH - 1;
+  const int KCN = tail ? AK_KT : AK_KP, j0 = kc * AK_KP;
+  unsigned char* base = a.smem;
+  const uint32_t sb = ak_su32(base);
+  uint8_t* Mk = reinterpret_cast<uint8_t*>(base + AK_OFF_MK);
+#ifdef PI05_NULL_ATT  // dev-only skeleton: the unit's TMAs / math skipped, the counter release kept
+  __syncthreads();
+  if (tid == 0) red_release(a.cnt + (CNT_ATT + rg) * CNT_STRIDE);
+  return;
+#endif
+  if (tid < KCN) { const int j = j0 + tid; Mk[tid] = j < P ? (a.mask[j] != 0) : (j < NK); }
+  if (tid == 0) {
+    asm volatile("fence.proxy.async.global;" ::: "memory");  // generic-proxy writes of the B tasks -> visible to the TMA after the barrier
+    const uint32_t bK = sb + AK_OFF_BAR, bV = bK + 8, bQ = bK + 16;
+    ak_mbar_expect(bQ, 4 * AK_QBLK);
+#pragma unroll
+    for (int cb = 0; cb < 4; ++cb) ak_tma2d(sb + AK_OFF_Q + cb * AK_QBLK, ak_map(a.maps, AK_MAP_Q), bQ, cb * 64, rg * AK_R);
+    if (tail) {
+      ak_mbar_expect(bK, 4 * 56 * 128); ak_mbar_expect(bV, 4 * 56 * 128);
+#pragma unroll
+      for (int cb = 0; cb < 4; ++cb) {
+        ak_tma2d(sb + AK_OFF_K + cb * AK_KBLK + 8 * 128, ak_map(a.maps, AK_MAP_KS), bK, cb * 64, 0);
+        ak_tma2d(sb + AK_OFF_V + cb * AK_KBLK + 8 * 128, ak_map(a.maps, AK_MAP_VS), bV, cb * 64, 0);
+      }
+    }
+  }
+  ak_mbar_wait(sb + AK_OFF_BAR + 16, 0);
+  ak_mbar_wait(sb + AK_OFF_BAR, 0);
+  ak_mbar_wait(sb + AK_OFF_BAR + 8, 0);
+  __syncthreads();  // loads landed, mask visible
+  float* smx = reinterpret_cast<float*>(base + AK_OFF_X);
+  if (tail) ak_qk<2>(sb, Mk, smx, warp, lane); else ak_qk<3>(sb, Mk, smx, warp, lane);
+  __syncthreads();
+  if (tid < AK_R) {  // row stats (m, l): reduce the 4 key-group partials
+    const float m = fmaxf(fmaxf(smx[tid], smx[AK_R + tid]), fmaxf(smx[2 * AK_R + tid], smx[3 * AK_R + tid]));
+    const float* xs = smx + 4 * AK_R;
+    const float lsum = (xs[tid] + xs[AK_R + tid]) + (xs[2 * AK_R + tid] + xs[3 * AK_R + tid]);
+    const int row = rg * AK_R + tid;
+    if (row < QROWS) *reinterpret_cast<float2*>(a.stats + ((size_t)row * AK_NCH + kc) * 2) = make_float2(m, lsum);
+  }
+  // ---- P.V: warp w = output dims [32w, 32w + 32), both m-tiles
+  float acc[2][4][4];
+#pragma unroll
+  for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) acc[mt][nt][e] = 0.f;
+  {
+    const uint32_t pBase = sb + AK_OFF_S + ((x + ((lane >> 3) & 1) * 8) * AK_SS + (lane >> 4) * 8) * 2;
+    const uint32_t vBase = sb + AK_OFF_V;
+    const int nks = KCN / 16;
+#pragma unroll
+    for (int ks = 0; ks < AK_KP / 16; ++ks) {
+      if (ks < nks) {
+        uint32_t pa[2][4];
+#pragma unroll
+        for (int mt = 0; mt < 2; ++mt) ak_ldsm_x4(pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3], pBase + (mt * 16 * AK_SS + ks * 16) * 2);
+        const int krow = ks * 16 + x + ((lane >> 3) & 1) * 8;
+#pragma unroll
+        for (int np = 0; np < 2; ++np) {
+          const int ch = (warp & 1) * 4 + np * 2 + (lane >> 4);
+          uint32_t b0, b1, b2, b3;
+          ak_ldsm_x4t(b0, b1, b2, b3, vBase + (warp >> 1) * AK_KBLK + krow * 128 + (((ch ^ x) & 7) << 4));
+#pragma unroll
+          for (int mt = 0; mt < 2; ++mt) {
+            mma16816(acc[mt][2 * np], pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3], b0, b1);
+            mma16816(acc[mt][2 * np + 1], pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3], b2, b3);
+          }
+        }
+      }
+    }
+  }
+  // ---- partial O -> opart[chunk][row][256] (XOR-permuted float4 chunks)
+#pragma unroll
+  for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+      const int col = warp * 32 + nt * 8 + 2 * t4;
+      const int r0 = mt * 16 + g, r1 = r0 + 8;
+      const int rw0 = rg * AK_R + r0, rw1 = rg * AK_R + r1;
+      if (rw0 < QROWS)
+        *reinterpret_cast<float2*>(a.opart + ((size_t)kc * QROWS + rw0) * HD + ((((col >> 2) ^ r0) & 7) | (col >> 2 & ~7)) * 4 + (col & 3)) = make_float2(acc[mt][nt][0], acc[mt][nt][1]);
+      if (rw1 < QROWS)
+        *reinterpret_cast<float2*>(a.opart + ((size_t)kc * QROWS + rw1) * HD + ((((col >> 2) ^ r1) & 7) | (col >> 2 & ~7)) * 4 + (col & 3)) = make_float2(acc[mt][nt][2], acc[mt][nt][3]);
+    }
+  __syncthreads();
+  if (tid == 0) red_release(a.cnt + (CNT_ATT + rg) * CNT_STRIDE);
+}
+
+// combine: CTA (rg, kc) takes rows k = kc + 11 s (s = 0..2) of its own row group once the row group's 11 units have released; thread = (slot, column quad)
+// `it1` = (step * layers + l + 1): the counter epoch of this layer
+__device__ __noinline__ void ak_combine(AkArgs a, unsigned it1) {
+  const int tid = threadIdx.x;
+  if (blockIdx.x >= AK_NUNIT) return;
+  int rg, kc; ak_map_of(blockIdx.x, rg, kc);
+  const int slot = tid >> 6, cq = tid & 63, k = kc + AK_NCH * slot, row = rg * AK_R + k;
+  block_wait(a.cnt + (CNT_ATT + rg) * CNT_STRIDE, it1 * AK_NCH, a.backoff > 0);
+#ifndef PI05_NULL_ATT  // dev-only: the combine's loads, exp / fma and attn store skipped (the counter wait above is kept)
+  if (k < AK_R && row < QROWS) {
+    const float2* st = reinterpret_cast<const float2*>(a.stats + (size_t)row * AK_NCH * 2);
+    float4 o[AK_NCH];
+    float wgt[AK_NCH], ls[AK_NCH];
+#pragma unroll
+    for (int c = 0; c < AK_NCH; ++c) o[c] = __ldcg(reinterpret_cast<const float4*>(a.opart + ((size_t)c * QROWS + row) * HD + ((cq ^ row) & 7 | (cq & ~7)) * 4));
+#pragma unroll
+    for (int c = 0; c < AK_NCH; ++c) { const float2 v = __ldcg(st + c); wgt[c] = v.x; ls[c] = v.y; }
+    float M = wgt[0];
+#pragma unroll
+    for (int c = 1; c < AK_NCH; ++c) M = fmaxf(M, wgt[c]);
+    float4 num = make_float4(0.f, 0.f, 0.f, 0.f);
+    float den = 0.f;
+#pragma unroll
+    for (int c = 0; c < AK_NCH; ++c) {
+      const float w = wgt[c] == -INFINITY ? 0.f : expf(wgt[c] - M);
+      num.x = fmaf(w, o[c].x, num.x); num.y = fmaf(w, o[c].y, num.y); num.z = fmaf(w, o[c].z, num.z); num.w = fmaf(w, o[c].w, num.w);
+      den = fmaf(w, ls[c], den);
+    }
+    *reinterpret_cast<uint2*>(a.attn + (size_t)row * HD + cq * 4) = pack_bf16x4(num.x / den, num.y / den, num.z / den, num.w / den);
+  }
+#endif  // PI05_NULL_ATT
+}
+#endif  // PI05_ATT_K2
+
 // ------------------------------------------------------------- the kernel
-#if PI05_FG_UMMA
+#if PI05_FG_UMMA && PI05_ATT_K2
+__global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p, const __grid_constant__ FgMaps fgm, const __grid_constant__ AttMaps atm) {
+#elif PI05_ATT_K2
+__global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p, const __grid_constant__ AttMaps atm) {
+#elif PI05_FG_UMMA
 __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p, const __grid_constant__ FgMaps fgm) {
 #else
 __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
@@ -1608,6 +1922,9 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
 
   float* smf = reinterpret_cast<float*>(smem_raw);
   bf16* smb = reinterpret_cast<bf16*>(smem_raw);
+#if PI05_ATT_K2
+  const AkArgs ak{p.prefix_mask, p.attn, p.stats, p.opart, p.cnt, ak_base(smb), (unsigned long long)&atm, (int)((p.fuse & FUSE_BACKOFF) != 0)};
+#endif
   // ---- P1/P2: time MLP for all 10 times (FP32).
   cond_matvec(p.temb, smf, W, [&](int r) { return p.time_in_w + (size_t)r * W; },
               [&](int r) { return p.time_in_b + r; },
@@ -1695,7 +2012,11 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       prefetch_l2(p.prefix_k + (size_t)l * P * HD, (size_t)P * HD * 2);
       prefetch_l2(p.prefix_v + (size_t)l * P * HD, (size_t)P * HD * 2);
       PF_E(0);
-#if PI05_ATT_PREFILL == 2
+#if PI05_ATT_K2
+#ifndef PI05_NULL_ATT
+      ak_pre(ak, l);  // PI05_ATT_K2: the unit's prefix K / V TMA, issued before the B tasks (replaces the cp.async prefill below)
+#endif
+#elif PI05_ATT_PREFILL == 2 && !defined(PI05_NULL_ATT)
       // The prefill below (same copies and smem ordering), issued before the B tasks instead.
       if (blockIdx.x < ATT_NRG * ATT_NCHUNK) {
         __syncthreads();
@@ -1754,8 +2075,12 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
           }
         }
       }
+#if PI05_ATT_K2
+      // the B tasks' q / ksuf / vsuf stores (generic proxy) are read by the TMA after the B -> C barrier
+      if (gridDim.x - 1 - blockIdx.x < 10 * ((T + 7) / 8)) asm volatile("fence.proxy.async.global;" ::: "memory");
+#endif
       STOP_AT(2)
-#if PI05_ATT_PREFILL == 1
+#if PI05_ATT_PREFILL == 1 && !PI05_ATT_K2
       // Prefill of this block's first attention unit (u = blockIdx.x): prefix K/V rows, the
       // zero-filled rows past NK and the mask, none of which B writes. Smem ordering: Ks/Vs/Mk
       // overlap gemm_phase's A tile (As = smb), which every warp reads until its last mma of
@@ -1790,6 +2115,15 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       CST(9);
       SYNC();
       CST(0);
+#if PI05_ATT_K2
+      ak_unit(ak, l);  // PI05_NULL_ATT keeps only the unit's counter release (inside ak_unit)
+      CST(5);
+#elif defined(PI05_NULL_ATT)  // dev-only: C's loads / MMAs / softmax / stores skipped; every unit still releases its row-group counter (see the PI05_NULL_ATT note at the top)
+      for (int u = blockIdx.x; u < ATT_NRG * ATT_NCHUNK; u += gridDim.x) {
+        __syncthreads();
+        if (tid == 0 && (p.fuse & FUSE_CC3)) red_release(p.cnt + (CNT_ATT + (u % ATT_NRG)) * CNT_STRIDE);
+      }
+#else
       // ---- C: split-key attention. Unit = (ATT_ROWS query rows, ATT_KEYS keys):
       // scores = bf16(q.k)/16 (masked), chunk-local max m_c, p = bf16(exp(s - m_c)),
       // l_c = sum p, o_c = p.V. The combine phase rescales by exp(m_c - M).
@@ -2119,6 +2453,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
           CST(5);
         }
       }
+#endif  // PI05_NULL_ATT
       if (!(p.fuse & FUSE_CC3)) SYNC();
       // ---- C3 (no barrier): combine key chunks once a row group's ATT_NCHUNK units arrived:
       // out = sum_c e^(m_c-M) o_c / sum_c e^(m_c-M) l_c. Tasks of 4 rows go to the
@@ -2127,10 +2462,15 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       prefetch_l2(p.wg + (size_t)l * FF * W, (size_t)FF * W * 2);
       prefetch_l2(p.wu + (size_t)l * FF * W, (size_t)FF * W * 2);
       PF_E(1);
+#if PI05_ATT_K2
+      ak_combine(ak, it1);  // owner-sliced: CTAs 0..142 combine their own row group (needs FUSE_CC3, checked on the host)
+      CST(7);
+#else
       constexpr int CR = NTHREADS * 4 / HD;  // 4 rows per task, one column quad per thread
       for (int task = gridDim.x - 1 - blockIdx.x; task < QROWS / CR; task += gridDim.x) {
         if (p.fuse & FUSE_CC3) block_wait(p.cnt + (CNT_ATT + task * CR / ATT_ROWS) * CNT_STRIDE, it1 * ARR_ATT, backoff);
         CST(6);
+#ifndef PI05_NULL_ATT  // dev-only: the combine's loads, exp / fma and attn store skipped (the counter wait above is kept)
         const int i = (task * NTHREADS + tid) * 4, r = i / HD;
         // Pass 1: chunk maxima/sums (row-contiguous, float4 pairs). Pass 2: o_c in groups of
         // CG loads in flight; both passes accumulate in chunk order (deterministic).
@@ -2165,8 +2505,10 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
             }
         }
         *reinterpret_cast<uint2*>(p.attn + i) = pack_bf16x4(num.x / den, num.y / den, num.z / den, num.w / den);
+#endif  // PI05_NULL_ATT
         CST(7);
       }
+#endif  // PI05_ATT_K2
       CST(8);
       STOP_AT(3)
 #if !(PI05_WPRE & 8) || !(PI05_D_WPT > 1) || defined(PI05_D_CTL)
@@ -2468,6 +2810,48 @@ static void fg_prepare(const bf16* wg, const bf16* wu, bf16* ap, cudaStream_t st
   g_fgm_lo = wg; g_fgm_hi = wu; g_fgm_ap = ap;
 }
 #endif
+#if PI05_ATT_K2
+#include <cudaTypedefs.h>
+// Tensor maps of the K2 attention (prefix K / V, suffix K / V, q), rebuilt only when one of the five base pointers changes; passed as a __grid_constant__ parameter.
+static AttMaps g_atm;
+static const void* g_atm_key[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+static void att_prepare(const bf16* pk, const bf16* pv, const bf16* ksuf, const bf16* vsuf, const bf16* q) {
+  const void* key[5] = {pk, pv, ksuf, vsuf, q};
+  bool same = true;
+  for (int i = 0; i < 5; ++i) same &= g_atm_key[i] == key[i];
+  if (same) return;
+  PFN_cuTensorMapEncodeTiled_v12000 enc = nullptr;
+  cudaDriverEntryPointQueryResult qr;
+  TORCH_CHECK(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", (void**)&enc, 12000, cudaEnableDefault, &qr) == cudaSuccess &&
+              enc != nullptr, "cuTensorMapEncodeTiled unavailable");
+  AttMaps m;
+  memset(&m, 0, sizeof m);
+  auto mk = [&](CUtensorMap* out, const void* base, int rows, int box_rows, const char* what) {
+    TORCH_CHECK(((uintptr_t)base & 15) == 0, "PI05_ATT_K2: ", what, " base must be 16 B aligned");
+    cuuint64_t dims[2] = {(cuuint64_t)HD, (cuuint64_t)rows}, strides[1] = {(cuuint64_t)HD * 2};
+    cuuint32_t box[2] = {64, (cuuint32_t)box_rows}, es[2] = {1, 1};
+    CUresult r = enc(out, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, const_cast<void*>(base), dims, strides, box, es, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                     CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(r == CUDA_SUCCESS, "PI05_ATT_K2 tensor map ", what, " encode failed ", (int)r);
+  };
+  mk(&m.k, pk, L * P, AK_KP, "K");
+  mk(&m.v, pv, L * P, AK_KP, "V");
+  mk(&m.k8, pk, L * P, 8, "K8");
+  mk(&m.v8, pv, L * P, 8, "V8");
+  mk(&m.ks, ksuf, T, 56, "Ksuf");
+  mk(&m.vs, vsuf, T, 56, "Vsuf");
+  mk(&m.q, q, QROWS, AK_R, "Q");
+  g_atm = m;
+  for (int i = 0; i < 5; ++i) g_atm_key[i] = key[i];
+}
+int64_t att_timeouts() {  // mbarrier wait timeouts since the last call (non-zero = the attention read garbage), 0 if none
+  cudaDeviceSynchronize();
+  unsigned to = 0, z = 0;
+  cudaMemcpyFromSymbol(&to, g_ak_to, 4);
+  cudaMemcpyToSymbol(g_ak_to, &z, 4);
+  return (int64_t)to;
+}
+#endif
 #if PI05_FG_UMMA
 int64_t fg_timeouts() {  // mbarrier wait timeouts since the last call (non-zero = F produced garbage), 0 if none
   cudaDeviceSynchronize();
@@ -2533,7 +2917,15 @@ void launch(std::vector<torch::Tensor> in, torch::Tensor actions, torch::Tensor 
   p.cst = tstamp.numel() >= 4096 + (int64_t)n_steps * n_layers * g_grid * CST_N ? p.tstamp + 4096 : nullptr;
   if (p.cst != nullptr) p.tmax = 4096;
 #endif
+#if PI05_ATT_K2
+  TORCH_CHECK((fuse & FUSE_CC3) != 0, "PI05_ATT_K2 needs the counter handoff (FUSE_CC3)");
+  att_prepare(p.prefix_k, p.prefix_v, p.ksuf, p.vsuf, p.q);
+#if !PI05_FG_UMMA
+  void* args[] = {&p, &g_atm};
+#endif
+#else
   void* args[] = {&p};
+#endif
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 #if PI05_FG_UMMA
   TORCH_CHECK((fuse & FUSE_DEFNORM) && !(fuse & FUSE_FG), "PI05_FG_UMMA needs FUSE_DEFNORM and no FUSE_FG");
@@ -2546,7 +2938,11 @@ void launch(std::vector<torch::Tensor> in, torch::Tensor actions, torch::Tensor 
   at[1].id = cudaLaunchAttributeClusterDimension;
   at[1].val.clusterDim.x = 2; at[1].val.clusterDim.y = 1; at[1].val.clusterDim.z = 1;
   lc.attrs = at; lc.numAttrs = 2;
+#if PI05_ATT_K2
+  cudaError_t err = cudaLaunchKernelEx(&lc, pi05_megakernel, p, g_fgm, g_atm);
+#else
   cudaError_t err = cudaLaunchKernelEx(&lc, pi05_megakernel, p, g_fgm);
+#endif
 #else
   cudaError_t err = cudaLaunchCooperativeKernel((void*)pi05_megakernel, dim3(g_grid), dim3(NTHREADS), args,
                                                 SMEM_BYTES, stream);
@@ -2569,8 +2965,11 @@ std::string build_config() {
 #define PI05_CFG(name) s += #name "=" PI05_STR(name) " ";
   PI05_CFG(PI05_FG_UMMA) PI05_CFG(PI05_LOAD_HOIST) PI05_CFG(PI05_GEMM_SPREAD) PI05_CFG(PI05_PART_BF16) PI05_CFG(PI05_WPRE)
   PI05_CFG(PI05_BARRIER) PI05_CFG(PI05_D_WPT) PI05_CFG(PI05_ATT_FA) PI05_CFG(PI05_TAIL) PI05_CFG(PI05_ATT_KEYS) PI05_CFG(PI05_PREFIX)
-  PI05_CFG(PI05_ATT_PREFILL) PI05_CFG(PI05_TILE_ROT)
+  PI05_CFG(PI05_ATT_PREFILL) PI05_CFG(PI05_TILE_ROT) PI05_CFG(PI05_ATT_K2)
 #undef PI05_CFG
+#ifdef PI05_NULL_ATT
+  s += "NULL_ATT ";
+#endif
 #ifdef PI05_NULL_FG
   s += "NULL_FG ";
 #endif
@@ -2589,5 +2988,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("layout_offsets", &layout_offsets);
 #if PI05_FG_UMMA
   m.def("fg_timeouts", &fg_timeouts);
+#endif
+#if PI05_ATT_K2
+  m.def("att_timeouts", &att_timeouts);
 #endif
 }
