@@ -75,6 +75,14 @@ def build_graph_arm(geo, inputs):
     return arm
 
 
+def pre_flip(extra) -> tuple:
+    """Extra -D flags of a build named relative to the pre-job-9134 default (PI05_FG_UMMA and PI05_ATT_K2 off): each
+    of the two is turned off unless ``extra`` sets it, so ``()`` is the old default build and ``("-DPI05_FG_UMMA=1",)``
+    the old umma build. The A/B drivers written before the default flip build through this to keep their meaning."""
+    off = tuple(f"-DPI05_{m}=0" for m in ("FG_UMMA", "ATT_K2") if not any(x.startswith(f"-DPI05_{m}=") for x in extra))
+    return (*off, *extra)
+
+
 def build_mk_arm(geo, inputs, variant: str = "k16", tstamp: bool = False, extra=(), fuse=None, tstamp_size: int = 4096):
     from .. import megakernel as MK
     arm = MK.MegakernelArm(geo, variant, "cuda", extra=tuple(extra), fuse=fuse)

@@ -6,7 +6,7 @@ Env: PROBE_PREFIX, PROBE_OUT, ROUNDS (12), PER_ROUND (3)."""
 import json, os, random, statistics
 import numpy as np
 import torch
-from .common import Recorder, build_mk_arm, l2_flush, make_geo_inputs, out_dir_from_env, setup_torch
+from .common import Recorder, build_mk_arm, pre_flip, l2_flush, make_geo_inputs, out_dir_from_env, setup_torch
 from .mk_analyze import analyze
 from .phases import PHASES, L, NSTEP, mk_slot, ideal_bytes
 
@@ -56,9 +56,9 @@ def main():
     geo, inputs = make_geo_inputs()
     arms, bufs = {}, {}
     for b, x in BUILDS.items():
-        arms[b, "plain"] = build_mk_arm(geo, inputs, "k64", extra=x)
-        arms[b, "gt"] = build_mk_arm(geo, inputs, "k64", extra=x)
-        arms[b, "clk"] = build_mk_arm(geo, inputs, "k64", extra=x + ("-DPI05_TS_CLOCK64",))
+        arms[b, "plain"] = build_mk_arm(geo, inputs, "k64", extra=pre_flip(x))
+        arms[b, "gt"] = build_mk_arm(geo, inputs, "k64", extra=pre_flip(x))
+        arms[b, "clk"] = build_mk_arm(geo, inputs, "k64", extra=pre_flip(x) + ("-DPI05_TS_CLOCK64",))
         print("config", b, arms[b, "clk"].ext.build_config(), flush=True)
         for k in ("gt", "clk"):
             bufs[b, k] = torch.zeros(4096, dtype=torch.int64, device="cuda")
@@ -101,7 +101,7 @@ def main():
         rec("stamps", build=b, **res[b])
     # ptrace arms
     for b, x in BUILDS.items():
-        a = build_mk_arm(geo, inputs, "k64", extra=x + ("-DPI05_PTRACE",))
+        a = build_mk_arm(geo, inputs, "k64", extra=pre_flip(x) + ("-DPI05_PTRACE",))
         buf = torch.zeros(4096 + NB * NCTA * 2, dtype=torch.int64, device="cuda")
         for _ in range(2):
             a.no_timing = off[b, "plain"]; a.launch()

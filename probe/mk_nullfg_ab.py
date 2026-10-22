@@ -6,7 +6,7 @@ Env: PROBE_PREFIX (968), PROBE_OUT, ROUNDS (40)."""
 import json, os, statistics
 import numpy as np
 import torch
-from .common import Recorder, build_mk_arm, l2_flush, make_geo_inputs, out_dir_from_env, setup_torch
+from .common import Recorder, build_mk_arm, pre_flip, l2_flush, make_geo_inputs, out_dir_from_env, setup_torch
 from .mk_analyze import analyze
 
 ROUNDS = int(os.environ.get("ROUNDS", "40"))
@@ -26,7 +26,7 @@ def main():
     geo, inputs = make_geo_inputs()
     V = {"default": (), "nullfg": ("-DPI05_NULL_FG",), "default_c64": ("-DPI05_TS_CLOCK64",),
          "nullfg_c64": ("-DPI05_NULL_FG", "-DPI05_TS_CLOCK64")}  # *_c64: block-0 clock64 stamps (cycles), stamped launches only
-    arms = {v: build_mk_arm(geo, inputs, "k64", extra=x) for v, x in V.items()}
+    arms = {v: build_mk_arm(geo, inputs, "k64", extra=pre_flip(x)) for v, x in V.items()}
     empty = {v: arms[v].no_timing for v in V}
     stamp = {v: torch.zeros(4096, dtype=torch.int64, device="cuda") for v in V}
     fl = l2_flush()

@@ -35,7 +35,7 @@ constexpr int FF = 4096;       // expert intermediate
 #define PI05_PREFIX 968
 #endif
 constexpr int P = PI05_PREFIX;  // prefix length
-// PI05_FG_UMMA (default 0): F (gate/up GEMM) + G (gelu*up) on tcgen05 cta_group::2 (needs sm_100a, cooperative launch with clusters of 2, FUSE_DEFNORM,
+// PI05_FG_UMMA (default 1 since job 9134; 0 = the mma.sync gemm_phase F + G loop, variant -nofgu): F (gate/up GEMM) + G (gelu*up) on tcgen05 cta_group::2 (needs sm_100a, cooperative launch with clusters of 2, FUSE_DEFNORM,
 // no FUSE_FG, PI05_WPRE bit 2, PI05_PART_BF16). E writes the activation tile A' for the TMA; the F->G grid barrier and G's reduce loop are gone.
 // Per layer that is one barrier fewer: later bar_epoch values shift by one per layer; the stamp slot (tcount) of the removed barrier is kept (block 0
 // stamps it with the time F returned), so slot numbering is unchanged but slot 6 now ends at F's exit and the "G" phase is the next-layer prefetch only.
@@ -46,7 +46,7 @@ constexpr int P = PI05_PREFIX;  // prefix length
 // F->G barrier: the L0 event difference (umma - umma-NULL_FG) is the in-situ cost of F + G for this build. Dev-only PI05_SMEM_PAD: default build with
 // the dynamic smem raised to the FG_UMMA footprint (isolates the L1-carveout cost of the larger smem).
 #ifndef PI05_FG_UMMA
-#define PI05_FG_UMMA 0
+#define PI05_FG_UMMA 1
 #endif
 constexpr int NK = P + T;      // keys seen by every suffix query
 constexpr int NORMS = 2 * L + 1;  // adaRMS norms per step (attn/ffn per layer + final)
@@ -102,7 +102,7 @@ constexpr size_t SMEM_C1 = (size_t)ATT_KEYS * KS_STRIDE * 2 + (size_t)ATT_ROWS *
 // gemm_phase_wsplit<2> footprint (A tile + partials + weights; asserted there).
 constexpr size_t SMEM_C2 = (size_t)64 * (KC + 32) * 2 + (size_t)NWARPS * T * 40 * 4 + (size_t)NWARPS * 2 * 4 * 32 * 16;
 constexpr size_t SMEM_T = (size_t)NSTEP * W * 4;
-// PI05_ATT_K2 (default 0): attention phase C + C3 on the K2 decomposition (port of probe/ubench/att/att_k2.cu variant k2_tma; same mma.sync m16n8k16 math as the
+// PI05_ATT_K2 (default 1 at PI05_PREFIX 968 since job 9134, else 0; 0 = the split-key attention, variant -noatt): attention phase C + C3 on the K2 decomposition (port of probe/ubench/att/att_k2.cu variant k2_tma; same mma.sync m16n8k16 math as the
 // default). Unit = (32 query rows, key chunk): 13 row groups x 11 chunks (10 prefix chunks of 96 keys + a tail chunk of 64 = prefix keys 960..967, the 50 suffix keys,
 // 6 pad) = 143 units on CTAs 0..142 (blk -> rg = blk % 13, chunk = 10 - blk / 13: the tail units sit on the lowest blocks, the B tasks run on the highest ones). QK^T warp
 // tiling is not redundant, the softmax is fused in registers, K / V / q arrive by TMA (SWIZZLE_128B tiles, 7 tensor maps passed as a __grid_constant__ AttMaps
@@ -113,7 +113,11 @@ constexpr size_t SMEM_T = (size_t)NSTEP * W * 4;
 // unit releases, combine's counter wait. The B -> C barrier orders the generic-proxy writes of q / ksuf / vsuf for the TMA (fence.proxy.async.global by the writers after
 // their B tasks and by the issuing thread before the q TMA).
 #ifndef PI05_ATT_K2
+#if PI05_PREFIX == 968
+#define PI05_ATT_K2 1
+#else
 #define PI05_ATT_K2 0
+#endif
 #endif
 #if PI05_ATT_K2
 constexpr int AK_R = 32, AK_NRG = (QROWS + AK_R - 1) / AK_R;  // 13

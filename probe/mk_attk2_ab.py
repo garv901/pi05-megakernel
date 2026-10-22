@@ -7,7 +7,7 @@ Env: PROBE_PREFIX (968), PROBE_OUT, ROUNDS (40), SEEDS."""
 import json, os, random, statistics
 import numpy as np
 import torch
-from .common import Recorder, build_mk_arm, l2_flush, make_geo_inputs, out_dir_from_env, setup_torch
+from .common import Recorder, build_mk_arm, pre_flip, l2_flush, make_geo_inputs, out_dir_from_env, setup_torch
 from .. import fixture as FX
 
 ROUNDS = int(os.environ.get("ROUNDS", "40"))
@@ -39,7 +39,7 @@ def main():
     rec = Recorder(out)
     setup_torch()
     geo, inputs = make_geo_inputs()
-    arms = {v: build_mk_arm(geo, inputs, "k64", extra=x) for v, x in V.items()}
+    arms = {v: build_mk_arm(geo, inputs, "k64", extra=pre_flip(x)) for v, x in V.items()}
     for v, a in arms.items():
         print("config", v, "|", a.ext.build_config(), flush=True)
         rec("config", variant=v, config=a.ext.build_config())
