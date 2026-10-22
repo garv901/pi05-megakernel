@@ -35,6 +35,16 @@ constexpr int FF = 4096;       // expert intermediate
 #define PI05_PREFIX 968
 #endif
 constexpr int P = PI05_PREFIX;  // prefix length
+// PI05_FG_UMMA (default 0): F (gate/up GEMM) + G (gelu*up) on tcgen05 cta_group::2 (needs sm_100a, cooperative launch with clusters of 2, FUSE_DEFNORM,
+// no FUSE_FG, PI05_WPRE bit 2, PI05_PART_BF16). E writes the activation tile A' for the TMA; the F->G grid barrier and G's reduce loop are gone.
+// Per layer that is one barrier fewer: later bar_epoch values shift by one per layer; the stamp slot (tcount) of the removed barrier is kept (block 0
+// stamps it with the time F returned), so slot numbering is unchanged but slot 6 now ends at F's exit and the "G" phase is the next-layer prefetch only.
+// PI05_NULL_FG with PI05_FG_UMMA: E (including A' stores) and the E->F split barrier are kept, F's TMA / MMA / epilogue are skipped, and so is the
+// F->G barrier: the L0 event difference (umma - umma-NULL_FG) is the in-situ cost of F + G for this build. Dev-only PI05_SMEM_PAD: default build with
+// the dynamic smem raised to the FG_UMMA footprint (isolates the L1-carveout cost of the larger smem).
+#ifndef PI05_FG_UMMA
+#define PI05_FG_UMMA 0
+#endif
 constexpr int NK = P + T;      // keys seen by every suffix query
 constexpr int NORMS = 2 * L + 1;  // adaRMS norms per step (attn/ffn per layer + final)
 constexpr int MODROW = NORMS * 3 * W;  // modulation floats per step
@@ -89,8 +99,15 @@ constexpr size_t SMEM_C1 = (size_t)ATT_KEYS * KS_STRIDE * 2 + (size_t)ATT_ROWS *
 // gemm_phase_wsplit<2> footprint (A tile + partials + weights; asserted there).
 constexpr size_t SMEM_C2 = (size_t)64 * (KC + 32) * 2 + (size_t)NWARPS * T * 40 * 4 + (size_t)NWARPS * 2 * 4 * 32 * 16;
 constexpr size_t SMEM_T = (size_t)NSTEP * W * 4;
+#if !(PI05_FG_UMMA || defined(PI05_SMEM_PAD))
 constexpr size_t SMEM_BYTES = SMEM_C1 > SMEM_C2 ? (SMEM_C1 > SMEM_T ? SMEM_C1 : SMEM_T)
                                                 : (SMEM_C2 > SMEM_T ? SMEM_C2 : SMEM_T);
+#else
+constexpr size_t SMEM_FGU = (size_t)16 * 4096 + 131072 + 1024;  // tcgen05 F: B tile + whole weight tile + alignment slack
+constexpr size_t SMEM_BYTES0 = SMEM_C1 > SMEM_C2 ? (SMEM_C1 > SMEM_T ? SMEM_C1 : SMEM_T)
+                                                 : (SMEM_C2 > SMEM_T ? SMEM_C2 : SMEM_T);
+constexpr size_t SMEM_BYTES = SMEM_BYTES0 > SMEM_FGU ? SMEM_BYTES0 : SMEM_FGU;
+#endif
 
 // Arrival counters replacing the reduce/combine grid barriers. Producers
 // publish (stores, fence, red.release) and consumers wait with ld.acquire for
@@ -1240,8 +1257,226 @@ __device__ __forceinline__ void action_tail_rows(const Params& p, const float* f
 #define STOP_AT(ph)
 #endif
 
+#if PI05_FG_UMMA
+// ------------------------------------------------------------- PI05_FG_UMMA: tcgen05 F (gate/up) + fused gelu*up
+// Port of probe/ubench/fg/fg_k1.cu variant cl2_s128_d1_fast_ts (K1_CL2: k1_E_nf<.., true, true> + k1_F2<16, 1, NF|PRE|CL2|FASTGELU|TSTORE>).
+// Swap-AB, weights on the MMA M side: CTA b < 128 owns 32 features x (gate, up) = 64 weight rows over the full K = 1024; CTAs 2k, 2k+1 form a
+// cluster and run one cta_group::2 MMA (M = 128, N = 64): CTA r loads its 64 weight rows (A) and 32 (r = 0: tokens 0..30 + shift) / 20 (r = 1:
+// tokens 31..49 + shift) activation rows (B). E writes A' = bf16(h * (1 + scale_F)) into the Ap workspace (+ the shift row), the MMA produces
+// W . A' and W . shift, the epilogue applies rs[t] (from ssp) and the shift, gelu_tanh(gate) * up, and stores act[t][f] (bf16) directly. There
+// is no split-K partial buffer, no F->G grid barrier (the H barrier orders act) and no G reduce loop. The weights are one
+// 128 KB stage (KB = 16, D = 1), issued before the E->F barrier (PRE). CTAs >= 128 only take part in the E->F split barrier.
+// cta_group::1 and ::2 cannot be mixed in one kernel; nothing else here uses tcgen05.
+#include <cuda.h>
+struct alignas(64) FgMaps {
+  CUtensorMap w;     // 4D weight map {W, 8, 2 (gate|up via the pointer delta), L * FF / 8}, box {64, 8, 2, 4}, SW128
+  CUtensorMap a32;   // Ap {W, 64}, box {64, 32}: rank 0's half of the pair's B
+  CUtensorMap a20;   // Ap {W, 64}, box {64, 20}: rank 1's half (19 tokens + shift)
+  bf16* ap;          // A' workspace [64][W] bf16 (rows 52..63 zero)
+  int gate_first;    // 1 if wg is at the lower address (map base), i.e. weight row g of a block is gate
+};
+__device__ unsigned g_fg_to;  // mbarrier wait timeouts (host reads through fg_timeouts())
+
+__shared__ __align__(8) unsigned long long fg_bar[48];  // full[0] @0, empty @8 (unused at D = 1), acc @32, rsr @33, abar @34
+__shared__ uint32_t fg_tslot;
+__shared__ __align__(16) float fg_rs[64];
+
+__device__ __forceinline__ uint32_t su32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+__device__ __forceinline__ void mbar_init(uint32_t b, int n) { asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(b), "r"(n)); }
+__device__ __forceinline__ void mbar_expect(uint32_t b, uint32_t bytes) { asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(b), "r"(bytes) : "memory"); }
+__device__ __forceinline__ void mbar_arrive(uint32_t b) { asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(b) : "memory"); }
+__device__ __forceinline__ void mbar_wait(uint32_t b, uint32_t par) {
+  uint32_t ok = 0;
+  for (unsigned long long i = 0; i < (1ull << 22) && !ok; ++i)
+    asm volatile("{\n.reg .pred P;\nmbarrier.try_wait.parity.shared::cta.b64 P, [%1], %2;\nselp.u32 %0, 1, 0, P;\n}" : "=r"(ok) : "r"(b), "r"(par) : "memory");
+  if (!ok) atomicAdd(&g_fg_to, 1u);
+}
+__device__ __forceinline__ void tma4d2(uint32_t dst, const CUtensorMap* m, uint32_t bar, int c0, int c1, int c2, int c3) {
+  asm volatile("cp.async.bulk.tensor.4d.cta_group::2.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4, %5, %6}], [%2];"
+               ::"r"(dst), "l"((unsigned long long)m), "r"(bar & 0xFEFFFFFFu), "r"(c0), "r"(c1), "r"(c2), "r"(c3) : "memory"); }
+__device__ __forceinline__ void tma2d2(uint32_t dst, const CUtensorMap* m, uint32_t bar, int c0, int c1) {
+  asm volatile("cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4}], [%2];"
+               ::"r"(dst), "l"((unsigned long long)m), "r"(bar & 0xFEFFFFFFu), "r"(c0), "r"(c1) : "memory"); }
+__device__ __forceinline__ void mma_tc2(uint32_t d, unsigned long long da, unsigned long long db, uint32_t id, uint32_t acc) {
+  asm volatile("{\n.reg .pred p;\nsetp.ne.b32 p, %4, 0;\ntcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, p;\n}"
+               ::"r"(d), "l"(da), "l"(db), "r"(id), "r"(acc) : "memory"); }
+__device__ __forceinline__ void commit2(uint32_t bar) { asm volatile("tcgen05.commit.cta_group::2.mbarrier::arrive::one.shared::cluster.multicast::cluster.b64 [%0], %1;" ::"r"(bar), "h"((unsigned short)3) : "memory"); }
+__device__ __forceinline__ void tmem_alloc64c2(uint32_t slot) { asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], 64;" ::"r"(slot)); }
+__device__ __forceinline__ void tmem_free64c2(uint32_t tb) { asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, 64;" ::"r"(tb)); }
+__device__ __forceinline__ void cluster_sync_all() { asm volatile("barrier.cluster.arrive.release;\nbarrier.cluster.wait.acquire;" ::: "memory"); }
+__device__ __forceinline__ void fence_after() { asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory"); }
+__device__ __forceinline__ void fence_before() { asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory"); }
+__device__ __forceinline__ void wait_ld() { asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory"); }
+__device__ __forceinline__ unsigned long long sdesc(uint32_t addr) { return (unsigned long long)((addr >> 4) & 0x3fff) | (1ull << 16) | (64ull << 32) | (1ull << 46) | (2ull << 61); }
+__device__ __forceinline__ uint32_t idesc(int N, int M) { return (1u << 4) | (1u << 7) | (1u << 10) | ((uint32_t)(N >> 3) << 17) | ((uint32_t)(M >> 4) << 24); }
+// gelu_tanh(x) = 0.5 x (1 + tanh z) = x * sigmoid(2 z), z = sqrt(2/pi) (x + 0.044715 x^3): one ex2 + one rcp instead of the software tanhf
+__device__ __forceinline__ float gelu_fast(float x) {
+  const float z2 = 1.5957691216057308f * fmaf(0.044715f * x, x * x, x);
+  return __fdividef(x, 1.0f + __expf(-z2));
+}
+__device__ __forceinline__ bool elect_one() { uint32_t e; asm volatile("{\n.reg .pred p;\nelect.sync _|p, 0xffffffff;\nselp.u32 %0, 1, 0, p;\n}" : "=r"(e)); return e != 0; }
+__device__ __forceinline__ void st_shared_b16(uint32_t a, unsigned short v) { asm volatile("st.shared.b16 [%0], %1;" ::"r"(a), "h"(v) : "memory"); }
+
+constexpr int FG_NCTA = 128;                     // CTAs with a 32-feature tile (the other 20 SMs only join the E->F barrier)
+constexpr int FG_BA = 4096;                      // 32 rows x 128 B: one K64 chunk of a CTA's B half
+constexpr size_t FG_RING = 131072;               // the CTA's whole 128 KB weight tile (16 K64 chunks x 8 KB), one stage
+constexpr size_t FG_SMEM = 16 * FG_BA + FG_RING + 1024;  // B tile 64 KB + weights + 1 KB alignment slack
+static_assert(NSSP == 16 && W == 1024 && FF == 4096 && FF / 32 == FG_NCTA, "FG_UMMA tile geometry");
+
+// E (defnorm): residual_tasks + A' = bf16(h * (1 + scale_F)) into the Ap workspace for the TMA'd activation tile; block 0 writes the shift row
+// (the MMA then produces W . shift in a token column for free). Ap row r: token t (t < 31), t + 1 (t >= 31: the pair's B halves are rows 0..31 and
+// 32..51); rows 31 and 51 hold the shift (the last column of each half).
+template <int S>
+__device__ __forceinline__ void fg_E(const Params& p, const FgMaps& m, const float* gate, const float* modF) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  for (int task = warp * gridDim.x + (gridDim.x - 1 - blockIdx.x); task < T * NSSP; task += gridDim.x * NWARPS) {
+    const int t = task / NSSP, c = (task % NSSP) * 64 + lane * 2;
+    const float2 sc = __ldcg(reinterpret_cast<const float2*>(modF + c));  // issued with the other loads
+    float2 x[S];
+#pragma unroll
+    for (int s = 0; s < S; ++s) x[s] = part_ld2(p.part, ((size_t)s * T + t) * W + c);
+    const float2 gv = __ldcg(reinterpret_cast<const float2*>(gate + c));
+    const unsigned hraw = __ldcg(reinterpret_cast<const unsigned*>(p.h + t * W + c));
+    const __nv_bfloat162 hold = *reinterpret_cast<const __nv_bfloat162*>(&hraw);
+    float2 v = make_float2(0.f, 0.f);
+#pragma unroll
+    for (int s = 0; s < S; ++s) { v.x += x[s].x; v.y += x[s].y; }
+    const float h0 = rbf(__fadd_rn(__low2float(hold), rbf(__fmul_rn(rbf(v.x), rbf(gv.x)))));
+    const float h1 = rbf(__fadd_rn(__high2float(hold), rbf(__fmul_rn(rbf(v.y), rbf(gv.y)))));
+    *reinterpret_cast<__nv_bfloat162*>(p.h + t * W + c) = __floats2bfloat162_rn(h0, h1);
+    const float ss = warp_sum(fmaf(h1, h1, h0 * h0));
+    if (lane == 0) p.ssp[task] = ss;
+    *reinterpret_cast<__nv_bfloat162*>(m.ap + (t >= 31 ? t + 1 : t) * W + c) = __floats2bfloat162_rn(__fmul_rn(h0, __fadd_rn(1.0f, sc.x)), __fmul_rn(h1, __fadd_rn(1.0f, sc.y)));
+  }
+  if (blockIdx.x == 0)
+    for (int i = threadIdx.x; i < W / 2; i += NTHREADS) {
+      const float2 sh = __ldcg(reinterpret_cast<const float2*>(modF + W + 2 * i));
+      *reinterpret_cast<__nv_bfloat162*>(m.ap + 31 * W + 2 * i) = __floats2bfloat162_rn(sh.x, sh.y);
+      *reinterpret_cast<__nv_bfloat162*>(m.ap + 51 * W + 2 * i) = __floats2bfloat162_rn(sh.x, sh.y);
+    }
+  asm volatile("fence.proxy.async.global;" ::: "memory");  // generic-proxy writes -> visible to the TMA (async proxy) after the barrier
+}
+
+// F: gate/up GEMM on tcgen05 + epilogue (rs, shift, gelu*up, act store). `w` is the E->F split barrier (arrive after the pair handshake, wait
+// before the activation TMA). Called by every thread of every CTA.
+__device__ __noinline__ void fg_F(const Params& p, const CUtensorMap* tmW, const CUtensorMap* tmA32, const CUtensorMap* tmA20, int gate_first, int l, const WPre& w, bf16* smb) {
+  constexpr int KB = 16, NST = 1, SB = KB * 8192, BA = FG_BA;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, cta = blockIdx.x, rank = cta & 1;
+  if (cta >= FG_NCTA) { wpre_arrive(w); wpre_wait(w); return; }
+  const uint32_t raw = su32(smb), base = (raw + 1023) & ~1023u;
+  const uint32_t bB = base, bW = base + 16 * BA;
+  const uint32_t bf = su32(fg_bar), bfull = bf, bacc = bf + 256, brs = bf + 264, babar = bf + 272;
+  const CUtensorMap* tmA = rank == 0 ? tmA32 : tmA20;
+  if (tid == 0) {
+    mbar_init(bfull, 1);
+    mbar_init(bacc, 1); mbar_init(brs, 2); mbar_init(babar, 1);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // earlier phases used this smem through the generic proxy
+  }
+  if (warp == 1) { tmem_alloc64c2(su32(&fg_tslot)); fence_before(); }
+  cluster_sync_all();  // both CTAs' barriers initialised and TMEM allocated before any cross-CTA TMA / MMA traffic
+  fence_after();
+  wpre_arrive(w);
+  if (tid == 0) {  // PRE: the whole weight tile does not depend on E
+    if (rank == 0) mbar_expect(bfull, 2 * SB);
+    for (int c = 0; c < KB; ++c) tma4d2(bW + c * 8192, tmW, bfull, c * 64, 0, 0, l * 512 + 4 * cta);
+  }
+  wpre_wait(w);
+  fence_after();
+  const uint32_t tb = fg_tslot;
+  if (warp == 0) {
+    if (lane == 0) {
+      if (rank == 0) mbar_expect(babar, (32 + 20) * 128 * 16);
+      for (int c = 0; c < 16; ++c) tma2d2(bB + c * BA, tmA, babar, c * 64, rank * 32);
+    }
+  } else if (warp == 1) {
+    if (rank == 0) {
+      const bool el = elect_one();
+      const unsigned long long dW0 = sdesc(bW), dB0 = sdesc(bB);
+      const uint32_t id = idesc(64, 128);
+      mbar_wait(babar, 0);
+      mbar_wait(bfull, 0);
+      fence_after();
+      if (el) {
+#pragma unroll
+        for (int c = 0; c < KB; ++c) {
+          const unsigned long long dA = dW0 + (unsigned long long)((c * 8192) >> 4), dB = dB0 + (unsigned long long)((c * BA) >> 4);
+#pragma unroll
+          for (int kk = 0; kk < 4; ++kk) mma_tc2(tb, dA + (unsigned long long)((kk * 32) >> 4), dB + (unsigned long long)((kk * 32) >> 4), id, (c | kk) != 0);
+        }
+        commit2(bacc);
+      }
+    }
+  } else if (warp < 4) {  // rs[t] = rsqrt(sum(ssp[t][0..15]) / W + eps)
+    const int t = tid - 64;
+    float rsv = 0.f;
+    if (t < T) {
+      float sx = 0.f;
+#pragma unroll
+      for (int j = 0; j < NSSP; ++j) sx += __ldcg(p.ssp + t * NSSP + j);
+      rsv = rsqrtf(__fadd_rn(sx * (1.0f / W), 1e-6f));
+    }
+    fg_rs[t] = rsv;
+    __syncwarp();
+    if (lane == 0) mbar_arrive(brs);
+  }
+  // ---- epilogue, all 8 warps: warp = (sub, q): TMEM lanes 32 q + 16 sub .. +15 = 16 rows of one 16-row weight block (blk), B-half h = q >> 1.
+  // D layout (cta_group::2, M = 128): CTA r holds its own 64 rows; lane m' (0..63) = row m', tokens = B-half 0 columns 0..31; lanes 64..127 = the same
+  // rows for B-half 1 (columns stored at 0..31). Thread (lane) holds gate row g and up row g + 8 of the same feature: gelu*up is register-local.
+  {
+    __syncwarp();
+    const int q = warp & 3, sub = warp >> 2, h = q >> 1, blk = (q & 1) * 2 + sub;
+    const uint32_t ta = tb + ((uint32_t)(q * 32 + sub * 16) << 16);
+    const int tq = (lane & 3) * 2;
+    const bool gf = gate_first != 0;
+    const uint32_t scr = bW + warp * 1024;  // per-warp transpose scratch (reuses the weight tile after the MMAs are done)
+    uint32_t va[16];
+    mbar_wait(brs, 0);
+    mbar_wait(bacc, 0);
+    fence_after();
+    asm volatile("tcgen05.ld.sync.aligned.16x256b.x4.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+                 : "=r"(va[0]), "=r"(va[1]), "=r"(va[2]), "=r"(va[3]), "=r"(va[4]), "=r"(va[5]), "=r"(va[6]), "=r"(va[7]), "=r"(va[8]), "=r"(va[9]), "=r"(va[10]),
+                   "=r"(va[11]), "=r"(va[12]), "=r"(va[13]), "=r"(va[14]), "=r"(va[15]) : "r"(ta));
+    wait_ld();
+    fence_before();
+    // shift column: h = 0 -> local column 31 (g = 3, lane&3 == 3, e = 1); h = 1 -> column 19 (g = 2, lane&3 == 1, e = 1)
+    const int src = (lane & ~3) | (h ? 1 : 3);
+    const float sh0 = __shfl_sync(0xffffffffu, __uint_as_float(h ? va[9] : va[13]), src);
+    const float sh1 = __shfl_sync(0xffffffffu, __uint_as_float(h ? va[11] : va[15]), src);
+    float rsr[8];
+#pragma unroll
+    for (int idx = 0; idx < 8; ++idx) rsr[idx] = fg_rs[(h ? 31 : 0) + 8 * (idx >> 1) + tq + (idx & 1)];  // <= 62; zero for t >= T
+    unsigned short ob[8];
+#pragma unroll
+    for (int idx = 0; idx < 8; ++idx) {
+      const float r0v = fmaf(rsr[idx], __uint_as_float(va[2 * (idx & ~1) + (idx & 1)]), sh0), r1v = fmaf(rsr[idx], __uint_as_float(va[2 * (idx & ~1) + 2 + (idx & 1)]), sh1);
+      const float gv = gf ? r0v : r1v, uv = gf ? r1v : r0v;
+      const float o = rbf(gelu_fast(rbf(gv))) * rbf(uv);
+      ob[idx] = __bfloat16_as_ushort(__float2bfloat16_rn(o));
+    }
+    const int nv = h ? 19 : 31;  // valid local columns
+#pragma unroll
+    for (int idx = 0; idx < 8; ++idx) {
+      const int c = 8 * (idx >> 1) + tq + (idx & 1);
+      if (c < nv) st_shared_b16(scr + c * 16 + (lane >> 2) * 2, ob[idx]);
+    }
+    __syncwarp();
+    if (lane < nv) {
+      uint4 u; asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(u.x), "=r"(u.y), "=r"(u.z), "=r"(u.w) : "r"(scr + lane * 16));
+      *reinterpret_cast<uint4*>(p.act + (size_t)((h ? 31 : 0) + lane) * FF + cta * 32 + blk * 8) = u;
+    }
+  }
+  __syncthreads();
+  if (warp == 1) { fence_after(); tmem_free64c2(tb); }
+}
+#endif  // PI05_FG_UMMA
+
 // ------------------------------------------------------------- the kernel
+#if PI05_FG_UMMA
+__global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p, const __grid_constant__ FgMaps fgm) {
+#else
 __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
+#endif
   extern __shared__ __align__(16) unsigned char smem_raw[];
   __shared__ float red[NWARPS];
   __shared__ int s_valid;
@@ -1959,7 +2194,11 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       SYNC();
       // ---- E: gated residual, FFN adaRMS.
       if (defnorm) {
+#if PI05_FG_UMMA
+        fg_E<QD / KC>(p, fgm, modstep + (size_t)(2 * l) * 3 * W + 2 * W, modstep + (size_t)(2 * l + 1) * 3 * W);
+#else
         residual_tasks<QD / KC>(p, modstep + (size_t)(2 * l) * 3 * W + 2 * W);
+#endif
       } else {
         for (int t = blockIdx.x; t < T; t += gridDim.x) {
           residual_row<QD / KC>(p, t, modstep + (size_t)(2 * l) * 3 * W + 2 * W,
@@ -1973,6 +2212,32 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
 #endif
       // ---- F: gate/up projections.
       // Gate tile j and up tile j arrive on the same counter.
+#if PI05_FG_UMMA
+      static_assert(PI05_BARRIER == 3, "PI05_FG_UMMA needs the counter barrier");
+      static_assert(PI05_WPRE & 2, "PI05_FG_UMMA needs the E->F split barrier (PI05_WPRE bit 2)");
+      static_assert(PI05_PART_BF16, "PI05_FG_UMMA's E reads bf16 split-K partials");
+#ifdef PI05_NULL_FG  // dev-only: E and the E->F barrier kept, F's TMA / MMA / epilogue skipped (see the PI05_FG_UMMA comment at the top)
+      {
+        const WPre w = wpre();
+        wpre_arrive(w);
+        wpre_wait(w);
+      }
+#else
+      fg_F(p, &fgm.w, &fgm.a32, &fgm.a20, fgm.gate_first, l, wpre(), smb);
+#endif
+#else
+#ifdef PI05_NULL_FG
+      // Dev-only NULL_FG: F's staging, weight loads, MMAs and partial stores are skipped; E->F's barrier (WPRE bit 2: arrive,
+      // wait, stamp slot) and F->G's SYNC are kept, so every epoch / stamp slot is unchanged. G keeps its next-layer L2
+      // prefetch and skips only the reduce + gelu*up. Used for the L0 event-difference ground truth (default - NULL_FG).
+#if PI05_WPRE & 2
+      {
+        const WPre w = wpre();
+        wpre_arrive(w);
+        wpre_wait(w);
+      }
+#endif
+#else
       gemm_phase(defnorm ? p.h : p.xn, W, p.wg + (size_t)l * FF * W, FF, p.wu + (size_t)l * FF * W, 2 * FF, nullptr,
                  2 * FF, p.part, smb, (p.fuse & FUSE_FG) ? p.cnt + CNT_GU * CNT_STRIDE : nullptr, 32, FF / 32,
                  defnorm ? p.ssp : nullptr, defnorm ? modstep + (size_t)(2 * l + 1) * 3 * W : nullptr
@@ -1980,8 +2245,16 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
                  , wpre()
 #endif
                  );
+#endif
+#endif  // PI05_FG_UMMA
       STOP_AT(6)
+#if PI05_FG_UMMA
+      // No F->G barrier (H's barrier orders act). Keep its stamp slot so slot numbering is unchanged.
+      if (p.tstamp != nullptr && blockIdx.x == 0 && threadIdx.x == 0 && tcount < p.tmax) p.tstamp[tcount] = TS_NOW();
+      ++tcount;
+#else
       if (!(p.fuse & FUSE_FG)) SYNC();
+#endif
       // ---- G (no barrier): gelu_tanh(gate) * up per 32-col group once its 16 tiles arrived.
       {
         const int ln = (l + 1 < p.n_layers) ? l + 1 : 0;
@@ -1991,9 +2264,15 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
         prefetch_l2(p.wv + (size_t)ln * KVD * W, (size_t)KVD * W * 2);
         PF_E(3);
       }
+#if !PI05_FG_UMMA  // PI05_FG_UMMA: F's epilogue already wrote act
       {
         constexpr int GR = (T + 1) / 2;  // tasks: (32-col group, half of the rows), one quad per thread
-        for (int task = gridDim.x - 1 - blockIdx.x; task < 2 * (FF / 32); task += gridDim.x) {
+#ifdef PI05_NULL_FG  // dev-only: G's reduce + gelu*up + act store skipped (its next-layer prefetches above are kept)
+        for (int task = 0; task < 0; ++task)
+#else
+        for (int task = gridDim.x - 1 - blockIdx.x; task < 2 * (FF / 32); task += gridDim.x)
+#endif
+        {
           const int jg = task >> 1, t = (task & 1) * GR + tid / 8, c = jg * 32 + (tid % 8) * 4;
           if (p.fuse & FUSE_FG) block_wait(p.cnt + (CNT_GU + jg) * CNT_STRIDE, it1 * ARR_GU, backoff);
           if (tid / 8 < GR && t < T) {
@@ -2005,6 +2284,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
           }
         }
       }
+#endif
       STOP_AT(7)
 #if !(PI05_WPRE & 4)
       SYNC();
@@ -2079,6 +2359,9 @@ struct Layout {
 #if PI05_BARRIER
   size_t bar;
 #endif
+#if PI05_FG_UMMA
+  size_t ap;  // A' tile [64][W] bf16 for the F TMA (rows 52..63 stay zero)
+#endif
 };
 
 static Layout make_layout() {
@@ -2112,6 +2395,10 @@ static Layout make_layout() {
 #if PI05_BARRIER
   o.bar = take((size_t)BAR_WORDS * 4);
 #endif
+#if PI05_FG_UMMA
+  off = (off + 1023) & ~(size_t)1023;
+  o.ap = take((size_t)64 * W * 2);
+#endif
   o.total = off;
   return o;
 }
@@ -2131,11 +2418,65 @@ int64_t setup(int64_t device) {
 #if PI05_BARRIER
   TORCH_CHECK(g_grid <= 160, "barrier flag array holds 160 blocks");
 #endif
+#if PI05_FG_UMMA
+  TORCH_CHECK(g_grid % 2 == 0 && g_grid >= FG_NCTA, "PI05_FG_UMMA launches clusters of 2 and needs >= 128 CTAs");
+#endif
   return g_grid;
 }
 
 template <typename TT>
 static TT* ptr(const torch::Tensor& t) { return reinterpret_cast<TT*>(t.data_ptr()); }
+
+#if PI05_FG_UMMA
+#include <cudaTypedefs.h>
+// Tensor maps of the tcgen05 F phase, rebuilt only when the wg / wu / Ap pointers change (passed to the kernel as a __grid_constant__ parameter, so
+// they are stream-ordered with the launch). Ap is zeroed (stream-ordered) when its address changes: rows 52..63 are never written by E.
+static FgMaps g_fgm;
+static const void *g_fgm_lo = nullptr, *g_fgm_hi = nullptr, *g_fgm_ap = nullptr;
+static void fg_prepare(const bf16* wg, const bf16* wu, bf16* ap, cudaStream_t stream) {
+  if (g_fgm_lo == (const void*)wg && g_fgm_hi == (const void*)wu && g_fgm_ap == (const void*)ap) return;
+  PFN_cuTensorMapEncodeTiled_v12000 enc = nullptr;
+  cudaDriverEntryPointQueryResult qr;
+  TORCH_CHECK(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", (void**)&enc, 12000, cudaEnableDefault, &qr) == cudaSuccess &&
+              enc != nullptr, "cuTensorMapEncodeTiled unavailable");
+  const bool gate_first = (uintptr_t)wg < (uintptr_t)wu;
+  const bf16* lo = gate_first ? wg : wu;
+  const bf16* hi = gate_first ? wu : wg;
+  const size_t delta = (size_t)((const char*)hi - (const char*)lo);
+  TORCH_CHECK(delta > 0 && delta % 16 == 0, "PI05_FG_UMMA: wg / wu pointer delta must be positive and a multiple of 16 B (got ", delta, ")");
+  FgMaps m;
+  memset(&m, 0, sizeof m);
+  {
+    cuuint64_t dims[4] = {W, 8, 2, (cuuint64_t)L * (FF / 8)}, strides[3] = {(cuuint64_t)W * 2, (cuuint64_t)delta, (cuuint64_t)W * 2 * 8};
+    cuuint32_t box[4] = {64, 8, 2, 4}, es[4] = {1, 1, 1, 1};
+    CUresult r = enc(&m.w, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, (void*)lo, dims, strides, box, es, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                     CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(r == CUDA_SUCCESS, "weight tensor map encode failed ", (int)r, " (delta ", delta, ")");
+  }
+  for (int k = 0; k < 2; ++k) {
+    cuuint64_t dims[2] = {W, 64}, strides[1] = {(cuuint64_t)W * 2};
+    cuuint32_t box[2] = {64, (cuuint32_t)(k == 0 ? 32 : 20)}, es[2] = {1, 1};
+    CUresult r = enc(k == 0 ? &m.a32 : &m.a20, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)ap, dims, strides, box, es, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                     CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(r == CUDA_SUCCESS, "A tensor map encode failed ", (int)r);
+  }
+  m.ap = ap;
+  m.gate_first = gate_first ? 1 : 0;
+  TORCH_CHECK(((uintptr_t)ap & 15) == 0, "Ap must be 16 B aligned");
+  TORCH_CHECK(cudaMemsetAsync(ap, 0, (size_t)64 * W * 2, stream) == cudaSuccess, "Ap memset failed");
+  g_fgm = m;
+  g_fgm_lo = wg; g_fgm_hi = wu; g_fgm_ap = ap;
+}
+#endif
+#if PI05_FG_UMMA
+int64_t fg_timeouts() {  // mbarrier wait timeouts since the last call (non-zero = F produced garbage), 0 if none
+  cudaDeviceSynchronize();
+  unsigned to = 0, z = 0;
+  cudaMemcpyFromSymbol(&to, g_fg_to, 4);
+  cudaMemcpyToSymbol(g_fg_to, &z, 4);
+  return (int64_t)to;
+}
+#endif
 
 void launch(std::vector<torch::Tensor> in, torch::Tensor actions, torch::Tensor ws, int64_t n_steps,
             int64_t n_layers, torch::Tensor tstamp, int64_t fuse) {
@@ -2194,8 +2535,22 @@ void launch(std::vector<torch::Tensor> in, torch::Tensor actions, torch::Tensor 
 #endif
   void* args[] = {&p};
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+#if PI05_FG_UMMA
+  TORCH_CHECK((fuse & FUSE_DEFNORM) && !(fuse & FUSE_FG), "PI05_FG_UMMA needs FUSE_DEFNORM and no FUSE_FG");
+  bf16* ap = (bf16*)(base + o.ap);
+  fg_prepare(p.wg, p.wu, ap, stream);
+  cudaLaunchConfig_t lc = {};
+  lc.gridDim = dim3(g_grid); lc.blockDim = dim3(NTHREADS); lc.dynamicSmemBytes = SMEM_BYTES; lc.stream = stream;
+  cudaLaunchAttribute at[2];
+  at[0].id = cudaLaunchAttributeCooperative; at[0].val.cooperative = 1;
+  at[1].id = cudaLaunchAttributeClusterDimension;
+  at[1].val.clusterDim.x = 2; at[1].val.clusterDim.y = 1; at[1].val.clusterDim.z = 1;
+  lc.attrs = at; lc.numAttrs = 2;
+  cudaError_t err = cudaLaunchKernelEx(&lc, pi05_megakernel, p, g_fgm);
+#else
   cudaError_t err = cudaLaunchCooperativeKernel((void*)pi05_megakernel, dim3(g_grid), dim3(NTHREADS), args,
                                                 SMEM_BYTES, stream);
+#endif
   TORCH_CHECK(err == cudaSuccess, "pi05 megakernel launch failed: ", cudaGetErrorString(err));
 }
 
@@ -2206,9 +2561,33 @@ std::vector<int64_t> layout_offsets() {
           (int64_t)o.scores, (int64_t)o.stats, (int64_t)o.opart, (int64_t)o.attn, (int64_t)o.act, (int64_t)o.cnt, (int64_t)o.ssp};
 }
 
+#define PI05_STR2(x) #x
+#define PI05_STR(x) PI05_STR2(x)
+// Effective values of the tuning macros of this build (host-only; printed by the benchmark logs).
+std::string build_config() {
+  std::string s;
+#define PI05_CFG(name) s += #name "=" PI05_STR(name) " ";
+  PI05_CFG(PI05_FG_UMMA) PI05_CFG(PI05_LOAD_HOIST) PI05_CFG(PI05_GEMM_SPREAD) PI05_CFG(PI05_PART_BF16) PI05_CFG(PI05_WPRE)
+  PI05_CFG(PI05_BARRIER) PI05_CFG(PI05_D_WPT) PI05_CFG(PI05_ATT_FA) PI05_CFG(PI05_TAIL) PI05_CFG(PI05_ATT_KEYS) PI05_CFG(PI05_PREFIX)
+  PI05_CFG(PI05_ATT_PREFILL) PI05_CFG(PI05_TILE_ROT)
+#undef PI05_CFG
+#ifdef PI05_NULL_FG
+  s += "NULL_FG ";
+#endif
+#ifdef PI05_SMEM_PAD
+  s += "SMEM_PAD ";
+#endif
+  s += "SMEM_BYTES=" + std::to_string((size_t)SMEM_BYTES);
+  return s;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("build_config", &build_config);
   m.def("workspace_bytes", &workspace_bytes);
   m.def("setup", &setup);
   m.def("launch", &launch);
   m.def("layout_offsets", &layout_offsets);
+#if PI05_FG_UMMA
+  m.def("fg_timeouts", &fg_timeouts);
+#endif
 }

@@ -18,3 +18,5 @@ probe/ubench/hbm_ramp
 probe/ubench/gemm_task
 probe/ubench/gemm_tc
 probe/ubench/gemm_tc2
+probe/ubench/fg/*
+!probe/ubench/fg/*.*
