@@ -123,11 +123,13 @@ def load_w(w0, w1, w2, n1: cutlass.Constexpr, n2: cutlass.Constexpr, K: cutlass.
 def gemm_phase(A, w0, w1, w2, part, bar, pend, target, cnt, ssp, nmod,
                K: cutlass.Constexpr, n1: cutlass.Constexpr, n2: cutlass.Constexpr, N: cutlass.Constexpr,
                cdiv: cutlass.Constexpr, cmod: cutlass.Constexpr, norm: cutlass.Constexpr, counted: cutlass.Constexpr,
-               wpre: cutlass.Constexpr):
+               wpre: cutlass.Constexpr, load_hoist: cutlass.Constexpr):
     """A: (T, K) bf16 tensor; w0/w1/w2: (rows, K) bf16 weight tensors (virtual N = rows of w0 up to n1, w1 up to n2, w2 up to N);
     part: f32 workspace tensor; bar: u32 workspace `bar` tensor, pend/target: deferred barrier (pend runtime Boolean, wpre
     Constexpr says the call site may defer one); cnt: u32 workspace `cnt` tensor (counted); ssp (T, NSSP) f32 and nmod (f32,
-    scale at nmod[k], shift at nmod[W + k]) for norm mode."""
+    scale at nmod[k], shift at nmod[W + k]) for norm mode. load_hoist (Knobs.load_hoist / PI05_LOAD_HOIST): 1 = the next tile's
+    weight load goes right after the tile's last MMA, before the partial stores (rB is dead there; same math and store order),
+    0 = after the stores."""
     tid, _, _ = cute.arch.thread_idx()
     bid, _, _ = cute.arch.block_idx()
     nb, _, _ = cute.arch.grid_dim()
@@ -191,6 +193,10 @@ def gemm_phase(A, w0, w1, w2, part, bar, pend, target, cnt, ssp, nmod,
             cute.gemm(tm, acc, rA[None, None, kb], rB[None, None, kb], acc)
         IM.gmark_loop("g_mma")
         n0 = ngi * 32
+        if cutlass.const_expr(load_hoist):
+            if ngi + ng_step < NG:
+                load_w(w0, w1, w2, n1, n2, K, ngi + ng_step, k0, tmm, rB)
+                IM.gmark_loop("g_wnext")
         for mt in cutlass.range_constexpr(4):
             for r8 in cutlass.range_constexpr(2):
                 row = mt * 16 + g + 8 * r8
@@ -201,9 +207,10 @@ def gemm_phase(A, w0, w1, w2, part, bar, pend, target, cnt, ssp, nmod,
                                                cute.make_layout(2))
                         cute.copy(uni(Float32, 64), acc[(None, r8), mt, nt], dst)
         IM.gmark_loop("g_st")
-        if ngi + ng_step < NG:
-            load_w(w0, w1, w2, n1, n2, K, ngi + ng_step, k0, tmm, rB)
-            IM.gmark_loop("g_wnext")
+        if cutlass.const_expr(not load_hoist):
+            if ngi + ng_step < NG:
+                load_w(w0, w1, w2, n1, n2, K, ngi + ng_step, k0, tmm, rB)
+                IM.gmark_loop("g_wnext")
         if cutlass.const_expr(counted):
             cute.arch.sync_warp()
             if lane == 0:

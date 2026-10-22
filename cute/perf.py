@@ -4,7 +4,7 @@ slower. Same inputs, CUDA and CuTe launches interleaved (CUDA, CuTe, CUDA, ...),
 events, L2 not flushed.
 
   python -m megabench.sota.pi05.cute.perf --prefix 968 --att-keys 64 [--seed S --iters N --stages pro,A,... --fuse F --wpre W
-                                           --d-wpt D --host-zero --out DIR]
+                                           --d-wpt D --load-hoist {0,1} --host-zero --out DIR]
 Prints one `LADDER {json}` line per stop and a table of the per-stage deltas (entry minus the previous entry of the ladder; the
 first entry is its own time) for CUDA, CuTe and CuTe - CUDA. Builds the CUDA extension per stop (cached by torch) and compiles the
 CuTe kernel per stop (about 20 s each)."""
@@ -46,6 +46,7 @@ def parse_args(argv=None):
     ap.add_argument("--fuse", type=int, default=18)
     ap.add_argument("--wpre", type=int, default=DEFAULT_WPRE)
     ap.add_argument("--d-wpt", type=int, default=DEFAULT_D_WPT)
+    ap.add_argument("--load-hoist", type=int, default=0, choices=(0, 1), help="Knobs.load_hoist (-DPI05_LOAD_HOIST for the CUDA arm)")
     ap.add_argument("--host-zero", action="store_true", help="CuTe arm zeroes cnt..bar from the host before each launch (phase 5 path)")
     ap.add_argument("--out", help="directory for ladder_p<P>_k<K>.json")
     args = ap.parse_args(argv)
@@ -58,7 +59,7 @@ def parse_args(argv=None):
     if args.iters < 1:
         ap.error("--iters must be positive")
     args.knobs = Knobs(prefix=args.prefix, att_keys=args.att_keys, fuse=args.fuse, wpre=args.wpre, d_wpt=args.d_wpt,
-                       host_zero=args.host_zero)
+                       load_hoist=args.load_hoist, host_zero=args.host_zero)
     return args
 
 
@@ -118,7 +119,7 @@ def main(argv=None) -> int:
         row = {"label": label, "stage": stage, "layer": layer, **time_entry(args.knobs, inputs, stage, layer, args.iters)}
         rows.append(row)
         print("LADDER " + json.dumps({"prefix": args.prefix, "att_keys": args.att_keys, "fuse": args.fuse, "wpre": args.wpre,
-                                      "d_wpt": args.d_wpt, "host_zero": args.host_zero, "seed": args.seed, "iters": args.iters,
+                                      "d_wpt": args.d_wpt, "load_hoist": args.load_hoist, "host_zero": args.host_zero, "seed": args.seed, "iters": args.iters,
                                       "elapsed_s": round(time.time() - t0, 1), **row}), flush=True)
     deltas(rows)
     print(table(rows))

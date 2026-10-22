@@ -146,6 +146,12 @@ constexpr int NSSP = W / 64;  // sum-of-squares parts per row (64-column residua
 #ifndef PI05_GEMM_FRAG
 #define PI05_GEMM_FRAG 2
 #endif
+// gemm_phase next-tile weight load: 0 = after the partial-store loop, 1 = right after the tile's last MMA (before the stores;
+// b is dead there, so the L2 latency overlaps the stores). Same math / store order / counter publish position (bit-identical).
+// Default 1 since job 8779 (shim A/B, 30 L2-flushed launches): 8.192 ms vs 8.304 (-1.36%), 0 spills; variant -nolh = 0.
+#ifndef PI05_LOAD_HOIST
+#define PI05_LOAD_HOIST 1
+#endif
 // Per-step tail and step-0 input with the grid-parallel residual (fuse bit 16), round 14: 0 = row-serial
 // (residual_row last-layer branch: final norm, action_out, Euler, action_in + attention norm on 50 blocks);
 // 1 = last-layer residual_tasks writes h / ssp, SYNC, action_out + Euler as (row, 16 dims) block tasks
@@ -592,6 +598,9 @@ __device__ __noinline__ void gemm_phase(const bf16* __restrict__ A, int K, const
       }
     }
     const int n0 = ng * 32;
+#if PI05_LOAD_HOIST
+    if (ng + ng_step < NG) load_w(ng + ng_step, b);
+#endif
 #pragma unroll
     for (int mt = 0; mt < 4; ++mt)
 #pragma unroll
@@ -603,7 +612,9 @@ __device__ __noinline__ void gemm_phase(const bf16* __restrict__ A, int K, const
           *reinterpret_cast<float2*>(part + ((size_t)s * T + r0 + 8) * N + c) =
               make_float2(acc[mt][nt][2], acc[mt][nt][3]);
       }
+#if !PI05_LOAD_HOIST
     if (ng + ng_step < NG) load_w(ng + ng_step, b);
+#endif
     if (cnt != nullptr) {  // publish this 32-column partial tile (fence overlaps the next loads)
       __syncwarp();
       if (lane == 0) red_release(cnt + ((n0 / cdiv) % cmod) * CNT_STRIDE);

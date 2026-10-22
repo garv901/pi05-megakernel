@@ -89,7 +89,7 @@ def stage_d(v, wo, wd, l, modstep, epoch, nb, knobs: cutlass.Constexpr):
         gemm_phase_wsplit(v["attn"], wol, v["part"], v["bar"], target, K=QD, N=W, WPT=knobs.d_wpt, wpre=defer)
     else:
         gemm_phase(v["attn"], wol, wol, wol, v["part"], v["bar"], Boolean(False), target, v["cnt"], v["ssp"], v["mod"],
-                   K=QD, n1=W, n2=W, N=W, cdiv=1, cmod=1, norm=False, counted=False, wpre=False)
+                   K=QD, n1=W, n2=W, N=W, cdiv=1, cmod=1, norm=False, counted=False, wpre=False, load_hoist=knobs.load_hoist)
     return epoch
 
 
@@ -118,7 +118,7 @@ def stage_f(v, wg, wu, l, modstep, epoch, nb, knobs: cutlass.Constexpr):
     nmod = mod_tensor(row_addr(modstep, 2 * l + 1))
     gemm_phase(v["h"], wgl, wul, wul, v["part"], v["bar"], Boolean(True), target, cnt, v["ssp"], nmod,
                K=W, n1=FF, n2=2 * FF, N=2 * FF, cdiv=32, cmod=FF // 32, norm=True, counted=bool(knobs.fuse & FUSE_FG),
-               wpre=defer)
+               wpre=defer, load_hoist=knobs.load_hoist)
     return epoch
 
 
@@ -171,7 +171,8 @@ def stage_h(v, wd, l, modstep, epoch, nb, knobs: cutlass.Constexpr):
         target = (epoch * nb).to(Uint32)
     wdl = wd[l, None, None]
     gemm_phase(v["act"], wdl, wdl, wdl, v["part"], v["bar"], Boolean(True), target, v["cnt"], v["ssp"], v["mod"],
-               K=FF, n1=W, n2=W, N=W, cdiv=1, cmod=1, norm=False, counted=False, wpre=defer)
+               K=FF, n1=W, n2=W, N=W, cdiv=1, cmod=1, norm=False, counted=False, wpre=defer,
+               load_hoist=knobs.load_hoist)
     return epoch
 
 

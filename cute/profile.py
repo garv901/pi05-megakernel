@@ -32,6 +32,7 @@ def parse_args(argv=None):
     ap.add_argument("--att-keys", type=int, default=64)
     ap.add_argument("--seed", type=int, default=7301)
     ap.add_argument("--fuse", type=int, default=18, help="Knobs.fuse (50 = FUSE_ABL, the fused A + B phase)")
+    ap.add_argument("--load-hoist", type=int, default=0, choices=(0, 1), help="Knobs.load_hoist (1: next tile's weight load before the partial stores)")
     ap.add_argument("--n-steps", type=int, default=10)
     ap.add_argument("--warmups", type=int, default=2)
     ap.add_argument("--launches", type=int, default=1)
@@ -70,7 +71,7 @@ def main(argv=None) -> int:
     if args.compare:
         return compare(*args.compare)
     import torch
-    knobs = Knobs(prefix=args.prefix, att_keys=args.att_keys, fuse=args.fuse)
+    knobs = Knobs(prefix=args.prefix, att_keys=args.att_keys, fuse=args.fuse, load_hoist=args.load_hoist)
     inputs = make_inputs(knobs, args.seed)
     arm = cute_arm(knobs)
     arm.n_steps = args.n_steps
@@ -103,7 +104,7 @@ def main(argv=None) -> int:
     if args.save_actions:
         os.makedirs(os.path.dirname(os.path.abspath(args.save_actions)), exist_ok=True)
         torch.save(actions, args.save_actions)
-    rec = {"mode": args.mode, "prefix": args.prefix, "att_keys": args.att_keys, "fuse": args.fuse, "seed": args.seed, "n_steps": args.n_steps,
+    rec = {"mode": args.mode, "prefix": args.prefix, "att_keys": args.att_keys, "fuse": args.fuse, "load_hoist": args.load_hoist, "seed": args.seed, "n_steps": args.n_steps,
            "warmups": args.warmups, "launches": args.launches, "env": {k: os.environ.get(k) for k in ENV_KEYS},
            "compile_s": round(compile_s, 1), "launch_ms": ms, "entry": entry_name(arm),
            "actions_sha256": hashlib.sha256(actions.numpy().tobytes()).hexdigest()}

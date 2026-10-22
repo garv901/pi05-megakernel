@@ -414,7 +414,7 @@ def pi05_megakernel(action_in_weight: cute.Tensor, action_in_bias: cute.Tensor, 
                     IM.push("A")
                     gemm_phase(v["h"], wq[l, None, None], wk[l, None, None], wv[l, None, None], v["part"], v["bar"], pend, target,
                                v["cnt"], v["ssp"], ffn.mod_tensor(a_nmod), K=W, n1=QD, n2=QD + KVD, N=NQKV, cdiv=HD, cmod=10,
-                               norm=True, counted=fuse_ab, wpre=wpre_on)
+                               norm=True, counted=fuse_ab, wpre=wpre_on, load_hoist=knobs.load_hoist)
                     IM.pop()
                 pend = Boolean(False)
                 # Blocks up to the stop run always, the rest only when `keep` (a stop returns before the trailing barrier, which

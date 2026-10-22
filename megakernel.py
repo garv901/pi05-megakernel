@@ -26,6 +26,31 @@ ORDER = ("action_in_weight", "action_in_bias", "time_in_weight", "time_in_bias",
 ATT_KEYS = (64, 32, 16)
 
 
+def parse_variant(variant: str) -> dict:
+    """``k64`` -> {att_keys: 64, load_hoist: 0, hoist_off: False}; optional suffixes, each at most once:
+    ``lh`` = Knobs.load_hoist 1 (CuTe: gemm_phase next-tile weight load hoisted above the partial stores), ``nolh`` = CUDA
+    built with PI05_LOAD_HOIST=0 (not with lh).
+    The CUDA kernel hoists by default (PI05_LOAD_HOIST default 1), so for the CUDA arm ``k64`` and ``k64-lh`` are the
+    same build and ``k64-nolh`` is the A/B control. The CuTe arm reads att_keys and load_hoist only.
+    E.g. ``k64-nolh``. Shared by the CUDA and CuTe arms so they cannot drift."""
+    keys, *suffixes = variant.split("-")
+    if not keys.startswith("k") or not keys[1:].isdigit():
+        raise ValueError(f"bad variant {variant!r}: expected k<att_keys>[-lh|-nolh]")
+    out = {"att_keys": int(keys[1:]), "load_hoist": 0, "hoist_off": False}
+    if len(set(suffixes)) != len(suffixes):
+        raise ValueError(f"duplicate variant suffix in {variant!r}")
+    if "lh" in suffixes and "nolh" in suffixes:
+        raise ValueError(f"lh and nolh together in {variant!r}")
+    for suffix in suffixes:
+        if suffix == "lh":
+            out["load_hoist"] = 1
+        elif suffix == "nolh":
+            out["hoist_off"] = True
+        else:
+            raise ValueError(f"bad variant suffix {suffix!r} in {variant!r}: expected lh or nolh")
+    return out
+
+
 def variants() -> tuple[str, ...]:
     return tuple(f"k{k}" for k in ATT_KEYS)
 
@@ -59,7 +84,10 @@ class MegakernelArm:
                              "18 layers, 10 steps")
         self.variant = variant
         self.fuse = FUSE if fuse is None else fuse
-        self.att_keys = int(variant.lstrip("k"))
+        pv = parse_variant(variant)
+        self.att_keys, self.load_hoist = pv["att_keys"], 0 if pv["hoist_off"] else 1
+        if not self.load_hoist and "-DPI05_LOAD_HOIST=0" not in extra:  # the plain build hoists (PI05_LOAD_HOIST default 1)
+            extra = (*extra, "-DPI05_LOAD_HOIST=0")
         self.geo = geo
         self.ext = load(geo.prefix, self.att_keys, extra)
         self.device = torch.device(device)
@@ -72,7 +100,7 @@ class MegakernelArm:
         self.actions = torch.empty((geo.horizon, geo.action_dim), dtype=torch.float32,
                                    device=self.device)
         self.tensors: list[torch.Tensor] | None = None
-        self.config = {"att_keys": self.att_keys, "fuse": self.fuse, "prefix": geo.prefix,
+        self.config = {"att_keys": self.att_keys, "load_hoist": self.load_hoist, "fuse": self.fuse, "prefix": geo.prefix,
                        "launches_per_chunk": 1}
 
     def bind(self, inputs: dict) -> None:

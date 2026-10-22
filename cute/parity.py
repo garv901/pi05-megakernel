@@ -73,6 +73,8 @@ def build_flags(knobs: Knobs, stop=None):
         extra.append(f"-DPI05_WPRE={knobs.wpre}")
     if knobs.d_wpt != DEFAULT_D_WPT:
         extra.append(f"-DPI05_D_WPT={knobs.d_wpt}")
+    if knobs.load_hoist:
+        extra.append("-DPI05_LOAD_HOIST=1")
     return tuple(extra)
 
 
@@ -331,6 +333,7 @@ def main(argv=None):
     ap.add_argument("--fuse", type=int, default=18, help="Knobs.fuse of the CuTe kernel; the CUDA kernel gets fuse & 31 (19 = counter hand-off A->B, 50 = FUSE_ABL: CuTe 50, CUDA 18)")
     ap.add_argument("--wpre", type=int, default=DEFAULT_WPRE, help="Knobs.wpre (-DPI05_WPRE for the CUDA build)")
     ap.add_argument("--d-wpt", type=int, default=DEFAULT_D_WPT, help="Knobs.d_wpt (-DPI05_D_WPT for the CUDA build)")
+    ap.add_argument("--load-hoist", type=int, default=0, choices=(0, 1), help="Knobs.load_hoist (-DPI05_LOAD_HOIST for the CUDA build)")
     ap.add_argument("--host-zero", action="store_true", help="Knobs.host_zero: the host zeroes cnt..bar before each CuTe launch (A/B)")
     ap.add_argument("--check-reset", action="store_true", help="two back-to-back CuTe full launches: counters zero, 2nd == 1st")
     ap.add_argument("--n-steps", type=int, default=None, help="runtime step count of both kernels (debug truncation)")
@@ -345,7 +348,7 @@ def main(argv=None):
     ap.add_argument("--out")
     args = ap.parse_args(argv)
     knobs = Knobs(prefix=args.prefix, att_keys=args.att_keys, fuse=args.fuse, wpre=args.wpre, d_wpt=args.d_wpt,
-                  host_zero=args.host_zero)
+                  load_hoist=args.load_hoist, host_zero=args.host_zero)
     if args.check_reset:
         res = {"prefix": args.prefix, "att_keys": args.att_keys, "fuse": args.fuse, "seed": args.seed, "mask_tail": args.mask_tail,
                **check_reset(knobs, args.seed, args.mask_tail)}
@@ -362,7 +365,7 @@ def main(argv=None):
         print("TIMING " + json.dumps(res))
         return 0
     if args.compare:
-        res = {"prefix": args.prefix, "att_keys": args.att_keys, "fuse": args.fuse, "wpre": args.wpre, "d_wpt": args.d_wpt, "seed": args.seed,
+        res = {"prefix": args.prefix, "att_keys": args.att_keys, "fuse": args.fuse, "wpre": args.wpre, "d_wpt": args.d_wpt, "load_hoist": args.load_hoist, "seed": args.seed,
                "mask_tail": args.mask_tail, "host_zero": args.host_zero, "step": args.step, "layer": args.layer,
                "stages": compare_stages(knobs, args.stages.split(","), args.step, args.layer, args.seed, args.mask_tail,
                                          args.n_steps, args.n_layers)}
@@ -370,7 +373,7 @@ def main(argv=None):
         print(json.dumps(res, indent=1))
         if args.out:
             os.makedirs(args.out, exist_ok=True)
-            with open(os.path.join(args.out, f"parity_compare_p{args.prefix}_k{args.att_keys}_s{args.seed}_m{args.mask_tail}_f{args.fuse}_st{args.step}_w{args.wpre}_d{args.d_wpt}_h{int(args.host_zero)}_l{args.layer}_{args.stages.replace(',', '')}.json"), "w") as f:
+            with open(os.path.join(args.out, f"parity_compare_p{args.prefix}_k{args.att_keys}_s{args.seed}_m{args.mask_tail}_f{args.fuse}_st{args.step}_w{args.wpre}_d{args.d_wpt}_lh{args.load_hoist}_h{int(args.host_zero)}_l{args.layer}_{args.stages.replace(',', '')}.json"), "w") as f:
                 json.dump(res, f, indent=1)
         return 0 if res["ok"] else 1
     if not args.selfcheck:
