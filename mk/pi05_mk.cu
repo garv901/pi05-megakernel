@@ -275,6 +275,26 @@ constexpr unsigned ARR_DE = 2 * PI05_D_WPT * (QD / KC);  // FUSE_DE arrivals per
 #define PI05_AB_UMMA 0
 #endif
 #endif
+// PI05_H_UMMA (default 1 since job 9423 whenever its requirements hold, i.e. PI05_AB_UMMA and PI05_WPRE bit 4; 0 = the mma.sync gemm_phase H with 32
+// slabs, variant -nohu; job 9423: 6.131 vs 6.381 ms, -3.9%; bench job 9424: 6.169 vs 6.455 ms isolated, graph-pdl 7.471): H (down projection) on tcgen05 cta_group::2, port of probe/ubench/h/h_bench.cu variant k1_r128s16_sm_w4.
+// CTAs 0..127 = 64 cluster pairs = 4 row groups (256 output features, 128 per CTA, M = 256) x 16 K slices (256 of FF): each CTA TMAs its 64 KB Wd slice
+// as one 3D box before the F->H split barrier (WPRE bit 4), then its half (tokens 32 r .. 32 r + 31; rows >= T zero-filled by the TMA) of the act slice;
+// the epilogue packs bf16 with stmatrix.trans and writes 16 bf16 split-K slabs, which I (fg_E<16>) sums. Needs PI05_AB_UMMA (I = fg_E), PI05_WPRE
+// bit 4 and no FUSE_HI. CTAs 128..147 only take part in the F->H barrier.
+// PI05_D_UMMA (dev, default 0; else the K-slice count 8 or 16): D (o_proj) on the PI05_H_UMMA design (umma_down<QD, PI05_D_UMMA>): act = attn (K = QD),
+// weights = Wo, PI05_D_UMMA bf16 split-K slabs summed by E (fg_E). Needs PI05_H_UMMA's requirements plus PI05_WPRE bit 8, PI05_D_WPT > 1 and no FUSE_DE.
+// No gain (job 9429, 3 .so copies per arm): d16 +0.3%, d8 +0.8% vs gemm_phase_wsplit; D's whole in-situ cost is 2.0 us/layer (PI05_NULL_D: dev-only, D skipped,
+// the attention->D split barrier kept), so the wsplit path already sits at the act-latency floor the tcgen05 path has too.
+#ifndef PI05_D_UMMA
+#define PI05_D_UMMA 0
+#endif
+#ifndef PI05_H_UMMA
+#if PI05_AB_UMMA && (PI05_WPRE & 4) && PI05_PART_BF16
+#define PI05_H_UMMA 1
+#else
+#define PI05_H_UMMA 0
+#endif
+#endif
 // Debug-only per-block attention sub-phase stamps (round 8): CST_N globaltimer values per
 // (step, layer, block) written after the 4096-entry tstamp area. Never set in production.
 #ifdef PI05_CSTAMP
@@ -1433,6 +1453,14 @@ struct alignas(64) FgMaps {
 #if PI05_AB_UMMA
   CUtensorMap wq, wk, wv;  // PI05_AB_UMMA: {W, 8, 2 (rows j | j + 128 of a head), L * R / 8}, box {64, 8, 2, 4}, SW128
 #endif
+#if PI05_H_UMMA
+  CUtensorMap wd;    // PI05_H_UMMA: Wd {64, L * W, FF / 64}, box {64, 128, 4} (one CTA's 128 rows x 256 K), SW128
+  CUtensorMap act;   // act {FF, T}, box {64, 32}: rows >= T read as zero
+#endif
+#if PI05_D_UMMA
+  CUtensorMap wo;    // PI05_D_UMMA: Wo {64, L * W, QD / 64}, box {64, 128, QD / 64 / PI05_D_UMMA}, SW128
+  CUtensorMap attn;  // attn {QD, T}, box {64, 32}
+#endif
 };
 __device__ unsigned g_fg_to;  // mbarrier wait timeouts (host reads through fg_timeouts())
 
@@ -1627,6 +1655,9 @@ __device__ __noinline__ void fg_F(const Params& p, const CUtensorMap* tmW, const
       *reinterpret_cast<uint4*>(p.act + (size_t)((h ? 31 : 0) + lane) * FF + cta * 32 + blk * 8) = u;
     }
   }
+#if PI05_H_UMMA
+  asm volatile("fence.proxy.async.global;" ::: "memory");  // act (generic-proxy stores) -> H's act TMA after the F->H barrier
+#endif
   __syncthreads();
   if (warp == 1) { fence_after(); tmem_free64c2(tb); }
 }
@@ -1788,6 +1819,124 @@ __device__ __noinline__ void ab_A(const AbPtrs p, const CUtensorMap* tmWq, const
 }
 #endif  // PI05_AB_UMMA
 
+#if PI05_H_UMMA || PI05_D_UMMA
+// ------------------------------------------------------------- PI05_H_UMMA / PI05_D_UMMA: tcgen05 down projections (H: K = FF, D: K = QD), bf16 split-K slabs
+static_assert(PI05_AB_UMMA && (PI05_WPRE & 4) && PI05_PART_BF16, "PI05_H_UMMA / PI05_D_UMMA need PI05_AB_UMMA (I / E = fg_E), WPRE bit 4 and bf16 partials");
+constexpr int H_RPC = 128, H_NRG = W / (2 * H_RPC);
+constexpr uint32_t H_WCH = H_RPC * 128, H_ACH = 32 * 128;  // bytes of one K64 chunk: weights (128 rows), act (32 tokens)
+__shared__ __align__(8) unsigned long long h_bar[8];  // wbar @0, abar[c] @8 + 8 c, acc @40
+__shared__ uint32_t h_tslot;
+__device__ __forceinline__ void tma3d2(uint32_t dst, const CUtensorMap* m, uint32_t bar, int c0, int c1, int c2) {
+  asm volatile("cp.async.bulk.tensor.3d.cta_group::2.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4, %5}], [%2];"
+               ::"r"(dst), "l"((unsigned long long)m), "r"(bar & 0xFEFFFFFFu), "r"(c0), "r"(c1), "r"(c2) : "memory"); }
+__device__ __forceinline__ void tld16x256(uint32_t ta, uint32_t (&v)[16]) {
+  asm volatile("tcgen05.ld.sync.aligned.16x256b.x4.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
+               : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3]), "=r"(v[4]), "=r"(v[5]), "=r"(v[6]), "=r"(v[7]), "=r"(v[8]), "=r"(v[9]), "=r"(v[10]),
+                 "=r"(v[11]), "=r"(v[12]), "=r"(v[13]), "=r"(v[14]), "=r"(v[15]) : "r"(ta));
+}
+// Called by every thread of every CTA. CTA pair (2 i, 2 i + 1): row group rg = i % 4 (features 256 rg ..), K slice ks = i / 4; CTA rank r owns
+// features n0 = 256 rg + 128 r and supplies tokens 32 r .. 32 r + 31 of the pair's B. One M = 256, N = 64 accumulator (lane = feature, column = token).
+// CTAs >= 8 KS only take part in the split barrier.
+template <int K, int KS>
+__device__ __noinline__ void umma_down(float* part, const CUtensorMap* tmW, const CUtensorMap* tmA, int l, const WPre& w, bf16* smb) {
+  constexpr int H_NCTA = 2 * H_NRG * KS, H_KSL = K / KS, H_NCH = H_KSL / 64;
+  static_assert(H_NCTA <= 148 && H_NCH >= 1 && H_NCH <= 4 && H_NCH * (H_WCH + H_ACH) + 1024 <= FG_SMEM && T * (H_RPC * 2 + 16) <= H_NCH * H_WCH, "umma_down geometry");
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, cta = blockIdx.x, rank = cta & 1;
+  if (cta >= H_NCTA) { wpre_arrive(w); wpre_wait(w); return; }
+  const int pi = cta >> 1, rg = pi % H_NRG, ks = pi / H_NRG;
+  const int n0 = rg * 2 * H_RPC + rank * H_RPC, k0 = ks * H_KSL;
+  const uint32_t bW = (su32(smb) + 1023) & ~1023u, bA = bW + H_NCH * H_WCH;
+  const uint32_t mb = su32(h_bar), wbar = mb, abar = mb + 8, bacc = mb + 40;
+  if (tid == 0) {
+    mbar_init(wbar, 1);
+    for (int c = 0; c < H_NCH; ++c) mbar_init(abar + 8 * c, 1);
+    mbar_init(bacc, 1);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // earlier phases used this smem through the generic proxy
+  }
+  if (warp == 1) { tmem_alloc64c2(su32(&h_tslot)); fence_before(); }
+  cluster_sync_all();  // both CTAs' barriers initialised and TMEM allocated before any cross-CTA TMA / MMA traffic
+  fence_after();
+  wpre_arrive(w);
+  if (tid == 0) {  // the weight slice does not depend on the previous phase: one 3D box {64, 128, H_NCH} before the barrier
+    if (rank == 0) mbar_expect(wbar, 2 * H_NCH * H_WCH);
+    tma3d2(bW, tmW, wbar, 0, l * W + n0, k0 >> 6);
+  }
+  wpre_wait(w);
+  const uint32_t tb = h_tslot;
+  if (warp == 0) {
+    if (lane == 0)
+      for (int c = 0; c < H_NCH; ++c) {
+        if (rank == 0) mbar_expect(abar + 8 * c, 2 * H_ACH);
+        tma2d2(bA + c * H_ACH, tmA, abar + 8 * c, k0 + c * 64, rank * 32);
+      }
+  } else if (warp == 1 && rank == 0) {
+    const bool el = elect_one();
+    const unsigned long long dW0 = sdesc(bW), dA0 = sdesc(bA);
+    const uint32_t id = idesc(64, 2 * H_RPC);
+    mbar_wait(wbar, 0);
+    for (int c = 0; c < H_NCH; ++c) {
+      mbar_wait(abar + 8 * c, 0);
+      fence_after();
+      if (el) {
+        const unsigned long long dW = dW0 + (unsigned long long)((c * H_WCH) >> 4), dA = dA0 + (unsigned long long)((c * H_ACH) >> 4);
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) mma_tc2(tb, dW + (unsigned long long)((kk * 32) >> 4), dA + (unsigned long long)((kk * 32) >> 4), id, (c | kk) != 0);
+      }
+      __syncwarp();
+    }
+    if (el) commit2(bacc);
+  }
+  // epilogue, all 8 warps: warp q = warp & 3 reads TMEM lanes (features) 32 q .. 32 q + 31, hs = warp >> 2 the token half. 16x256b fragments (thread =
+  // features l / 4, l / 4 + 8, tokens 2 (l % 4) + {0, 1} + 8 rep) are packed to bf16x2 and stored transposed with stmatrix: each 8 x 8 matrix lands as
+  // 8 token rows of 16 B in a [t][128] bf16 stage over the consumed weight tile (row pitch 272 B: conflict-free), then 16 B pieces go to the slab.
+  __syncwarp();
+  const int q = warp & 3, hs = warp >> 2;
+  constexpr uint32_t SST = H_RPC * 2 + 16;
+  mbar_wait(bacc, 0);
+  fence_after();
+  uint32_t va[2][16];
+#pragma unroll
+  for (int sub = 0; sub < 2; ++sub) tld16x256(tb + ((uint32_t)(32 * q + 16 * sub) << 16) + hs * 32, va[sub]);
+  wait_ld();
+  fence_before();
+  const int jm = lane >> 3, ri = lane & 7;
+#pragma unroll
+  for (int g4 = 0; g4 < 4; ++g4) {
+    const int sub = g4 >> 1;
+    uint32_t r[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int rep = (g4 & 1) * 2 + (j >> 1), hf = j & 1;
+      const __nv_bfloat162 b2 = __floats2bfloat162_rn(__uint_as_float(va[sub][4 * rep + 2 * hf]), __uint_as_float(va[sub][4 * rep + 2 * hf + 1]));
+      r[j] = *reinterpret_cast<const uint32_t*>(&b2);
+    }
+    const int rep = (g4 & 1) * 2 + (jm >> 1), hf = jm & 1;
+    const uint32_t sa = bW + (uint32_t)(hs * 32 + 8 * rep + ri) * SST + (uint32_t)(32 * q + 16 * sub + 8 * hf) * 2;
+    asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};" ::"r"(sa), "r"(r[0]), "r"(r[1]), "r"(r[2]), "r"(r[3]) : "memory");
+  }
+  __syncthreads();
+  for (int i = tid; i < T * (H_RPC / 8); i += NTHREADS) {
+    const int t = i / (H_RPC / 8), pc = i % (H_RPC / 8);
+    uint4 u; asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(u.x), "=r"(u.y), "=r"(u.z), "=r"(u.w) : "r"(bW + (uint32_t)t * SST + pc * 16));
+    *reinterpret_cast<uint4*>(reinterpret_cast<bf16*>(part) + ((size_t)ks * T + t) * W + n0 + pc * 8) = u;
+  }
+  __syncthreads();
+  if (warp == 1) { fence_after(); tmem_free64c2(tb); }
+}
+#endif  // PI05_H_UMMA || PI05_D_UMMA
+#if PI05_H_UMMA
+constexpr int H_KS = 16, H_S = H_KS;  // split-K slabs I sums
+#else
+constexpr int H_S = FF / KC;
+#endif
+#if PI05_D_UMMA
+static_assert((PI05_D_UMMA == 8 || PI05_D_UMMA == 16) && (PI05_WPRE & 8) && PI05_D_WPT > 1, "PI05_D_UMMA: 8 or 16 K slices, needs WPRE bit 8 and PI05_D_WPT > 1");
+constexpr int D_S = PI05_D_UMMA;  // split-K slabs E sums
+#else
+constexpr int D_S = QD / KC;
+#endif
+
 #if PI05_ATT_K2
 // ------------------------------------------------------------- PI05_ATT_K2: attention units (TMA + mma.sync) and the owner-sliced combine
 // Port of probe/ubench/att/att_k2.cu (variant k2_tma). Everything below is __noinline__ with by-value / pointer arguments only (no reference into the kernel frame).
@@ -1845,12 +1994,14 @@ __device__ __noinline__ void ak_pre(AkArgs a, int l) {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // earlier phases used this smem through the generic proxy
     const int rows = tail ? 8 : AK_KP, j0 = kc * AK_KP;
     const uint32_t bK = sb + AK_OFF_BAR, bV = bK + 8;
+#ifndef PI05_ATT_NOKV  // dev-only diagnostic: no K / V TMA and no K / V waits (the unit computes on stale smem; timing only)
     ak_mbar_expect(bK, 4 * rows * 128); ak_mbar_expect(bV, 4 * rows * 128);
 #pragma unroll
     for (int cb = 0; cb < 4; ++cb) {
       ak_tma2d(sb + AK_OFF_K + cb * AK_KBLK, ak_map(a.maps, tail ? AK_MAP_K8 : AK_MAP_K), bK, cb * 64, l * P + j0);
       ak_tma2d(sb + AK_OFF_V + cb * AK_KBLK, ak_map(a.maps, tail ? AK_MAP_V8 : AK_MAP_V), bV, cb * 64, l * P + j0);
     }
+#endif
     asm volatile("prefetch.tensormap [%0];" ::"l"(ak_map(a.maps, AK_MAP_Q)) : "memory");  // warm the descriptors used after the barrier
     if (tail) { asm volatile("prefetch.tensormap [%0];" ::"l"(ak_map(a.maps, AK_MAP_KS)) : "memory"); asm volatile("prefetch.tensormap [%0];" ::"l"(ak_map(a.maps, AK_MAP_VS)) : "memory"); }
   }
@@ -1950,6 +2101,7 @@ __device__ __noinline__ void ak_unit(AkArgs a, int l) {
     ak_mbar_expect(bQ, 4 * AK_QBLK);
 #pragma unroll
     for (int cb = 0; cb < 4; ++cb) ak_tma2d(sb + AK_OFF_Q + cb * AK_QBLK, ak_map(a.maps, AK_MAP_Q), bQ, cb * 64, rg * AK_R);
+#ifndef PI05_ATT_NOKV
     if (tail) {
       ak_mbar_expect(bK, 4 * 56 * 128); ak_mbar_expect(bV, 4 * 56 * 128);
 #pragma unroll
@@ -1958,10 +2110,13 @@ __device__ __noinline__ void ak_unit(AkArgs a, int l) {
         ak_tma2d(sb + AK_OFF_V + cb * AK_KBLK + 8 * 128, ak_map(a.maps, AK_MAP_VS), bV, cb * 64, 0);
       }
     }
+#endif
   }
   ak_mbar_wait(sb + AK_OFF_BAR + 16, 0);
+#ifndef PI05_ATT_NOKV
   ak_mbar_wait(sb + AK_OFF_BAR, 0);
   ak_mbar_wait(sb + AK_OFF_BAR + 8, 0);
+#endif
   __syncthreads();  // loads landed, mask visible
   float* smx = reinterpret_cast<float*>(base + AK_OFF_X);
   if (tail) ak_qk<2>(sb, Mk, smx, warp, lane); else ak_qk<3>(sb, Mk, smx, warp, lane);
@@ -2054,6 +2209,9 @@ __device__ __noinline__ void ak_combine(AkArgs a, unsigned it1) {
     *reinterpret_cast<uint2*>(a.attn + (size_t)row * HD + cq * 4) = pack_bf16x4(num.x / den, num.y / den, num.z / den, num.w / den);
   }
 #endif  // PI05_NULL_ATT
+#if PI05_D_UMMA
+  asm volatile("fence.proxy.async.global;" ::: "memory");  // attn (generic-proxy stores) -> D's act TMA after the attention->D barrier
+#endif
 }
 #endif  // PI05_ATT_K2
 
@@ -2808,7 +2966,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       SYNC();
 #endif
       CST(10);
-#if PI05_D_WPT > 1 && (PI05_WPRE & 8) && !defined(PI05_D_CTL)
+#if PI05_D_WPT > 1 && (PI05_WPRE & 8) && !defined(PI05_D_CTL) && !PI05_D_UMMA
       const bool de = defnorm && (p.fuse & FUSE_DE);  // E waits on per-group counters instead of the D -> E barrier
 #else
       const bool de = false;
@@ -2823,6 +2981,14 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       // Dev control (never in production): the split path is compiled but D runs gemm_phase.
       if (p.fuse & 1024) gemm_phase_wsplit<PI05_D_WPT>(p.attn, QD, p.wo + (size_t)l * W * QD, W, p.part, smb);
       else gemm_phase(p.attn, QD, p.wo + (size_t)l * W * QD, W, nullptr, W, nullptr, W, p.part, smb);
+#elif defined(PI05_NULL_D) && (PI05_WPRE & 8)  // dev-only: D's loads / MMAs / partial stores skipped, the attention->D split barrier kept (L0 diagnostic)
+      {
+        const WPre w = wpre();
+        wpre_arrive(w);
+        wpre_wait(w);
+      }
+#elif PI05_D_UMMA
+      umma_down<QD, PI05_D_UMMA>(p.part, &fgm.wo, &fgm.attn, l, wpre(), smb);
 #elif PI05_D_WPT > 1 && (PI05_WPRE & 8)
       gemm_phase_wsplit<PI05_D_WPT>(p.attn, QD, p.wo + (size_t)l * W * QD, W, p.part, smb, wpre(), de ? p.cnt + CNT_DE * CNT_STRIDE : nullptr);
 #elif PI05_D_WPT > 1
@@ -2836,7 +3002,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       const unsigned* dec = de ? p.cnt + CNT_DE * CNT_STRIDE : nullptr;
       if (defnorm) {
 #if PI05_FG_UMMA
-        fg_E<QD / KC>(p, fgm, modstep + (size_t)(2 * l) * 3 * W + 2 * W, modstep + (size_t)(2 * l + 1) * 3 * W, dec, it1 * ARR_DE, backoff);
+        fg_E<D_S>(p, fgm, modstep + (size_t)(2 * l) * 3 * W + 2 * W, modstep + (size_t)(2 * l + 1) * 3 * W, dec, it1 * ARR_DE, backoff);
 #else
         residual_tasks<QD / KC>(p, modstep + (size_t)(2 * l) * 3 * W + 2 * W, dec, it1 * ARR_DE, backoff);
 #endif
@@ -2933,6 +3099,10 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       // ---- H: down projection (warm the next norm's modulation row for I and the next A).
       // (WPRE 4: this prefetch is issued before the barrier, which runs inside gemm_phase.)
       prefetch_l2(modstep + (size_t)(2 * (l + 1)) * 3 * W, (size_t)3 * W * 4);
+#if PI05_H_UMMA
+      const bool hi = false;  // FUSE_HI is rejected on the host
+      umma_down<FF, H_KS>(p.part, &fgm.wd, &fgm.act, l, wpre(), smb);
+#else
       const bool hi = defnorm && (p.fuse & FUSE_HI);  // I waits on per-group counters instead of the H -> I barrier
       gemm_phase(p.act, FF, p.wd + (size_t)l * W * FF, W, nullptr, W, nullptr, W, p.part, smb,
                  hi ? p.cnt + CNT_HI * CNT_STRIDE : nullptr, 64, W / 64
@@ -2940,6 +3110,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
                  , nullptr, nullptr, wpre()
 #endif
                  );
+#endif
       STOP_AT(8)
       if (!hi) SYNC();
       const unsigned* hic = hi ? p.cnt + CNT_HI * CNT_STRIDE : nullptr;
@@ -2951,7 +3122,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
         if (defnorm && last) {
           prefetch_l2(p.action_out_w, (size_t)ADIM * W * 4);
           prefetch_l2(p.action_in_w, (size_t)W * ADIM * 4);
-          residual_tasks<FF / KC>(p, modstep + (size_t)(2 * l + 1) * 3 * W + 2 * W, hic, it1 * ARR_HI, backoff);
+          residual_tasks<H_S>(p, modstep + (size_t)(2 * l + 1) * 3 * W + 2 * W, hic, it1 * ARR_HI, backoff);
           SYNC();
           const bool more = step + 1 < p.n_steps;
 #if PI05_TAIL == 1
@@ -2974,9 +3145,9 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
 #endif
         if (defnorm && !last) {
 #if PI05_AB_UMMA  // I also writes A' = bf16(h (1 + scale_A)) + the shift rows for the next layer's attention norm (the next A's B tile)
-          fg_E<FF / KC>(p, fgm, modstep + (size_t)(2 * l + 1) * 3 * W + 2 * W, nextmod, hic, it1 * ARR_HI, backoff);
+          fg_E<H_S>(p, fgm, modstep + (size_t)(2 * l + 1) * 3 * W + 2 * W, nextmod, hic, it1 * ARR_HI, backoff);
 #else
-          residual_tasks<FF / KC>(p, modstep + (size_t)(2 * l + 1) * 3 * W + 2 * W, hic, it1 * ARR_HI, backoff);
+          residual_tasks<H_S>(p, modstep + (size_t)(2 * l + 1) * 3 * W + 2 * W, hic, it1 * ARR_HI, backoff);
 #endif
           a_nmod = nextmod;
         } else {
@@ -3089,9 +3260,11 @@ static TT* ptr(const torch::Tensor& t) { return reinterpret_cast<TT*>(t.data_ptr
 static FgMaps g_fgm;
 static const void *g_fgm_lo = nullptr, *g_fgm_hi = nullptr, *g_fgm_ap = nullptr;
 #if PI05_AB_UMMA
-static const void *g_fgm_q = nullptr, *g_fgm_k = nullptr, *g_fgm_v = nullptr;
-static void fg_prepare(const bf16* wg, const bf16* wu, bf16* ap, cudaStream_t stream, const bf16* wq, const bf16* wk, const bf16* wv) {
-  if (g_fgm_lo == (const void*)wg && g_fgm_hi == (const void*)wu && g_fgm_ap == (const void*)ap && g_fgm_q == (const void*)wq && g_fgm_k == (const void*)wk && g_fgm_v == (const void*)wv) return;
+static const void *g_fgm_q = nullptr, *g_fgm_k = nullptr, *g_fgm_v = nullptr, *g_fgm_d = nullptr, *g_fgm_act = nullptr, *g_fgm_o = nullptr, *g_fgm_attn = nullptr;
+static void fg_prepare(const bf16* wg, const bf16* wu, bf16* ap, cudaStream_t stream, const bf16* wq, const bf16* wk, const bf16* wv, const bf16* wd, const bf16* act,
+                       const bf16* wo, const bf16* attn) {
+  if (g_fgm_lo == (const void*)wg && g_fgm_hi == (const void*)wu && g_fgm_ap == (const void*)ap && g_fgm_q == (const void*)wq && g_fgm_k == (const void*)wk && g_fgm_v == (const void*)wv &&
+      g_fgm_d == (const void*)wd && g_fgm_act == (const void*)act && g_fgm_o == (const void*)wo && g_fgm_attn == (const void*)attn) return;
 #else
 static void fg_prepare(const bf16* wg, const bf16* wu, bf16* ap, cudaStream_t stream) {
   if (g_fgm_lo == (const void*)wg && g_fgm_hi == (const void*)wu && g_fgm_ap == (const void*)ap) return;
@@ -3135,6 +3308,29 @@ static void fg_prepare(const bf16* wg, const bf16* wu, bf16* ap, cudaStream_t st
     g_fgm_q = wq; g_fgm_k = wk; g_fgm_v = wv;
   }
 #endif
+#if PI05_H_UMMA || PI05_D_UMMA
+  // down-projection maps: weights {64, L * W, K / 64}, box {64, 128, K / 64 / KS} (one CTA's 128 rows x one K slice); act {K, T}, box {64, 32} (rows >= T read as zero)
+  auto dmaps = [&](CUtensorMap* mw, CUtensorMap* ma, const bf16* wt, const bf16* x, int K, int KS, const char* what) {
+    TORCH_CHECK(((uintptr_t)wt & 15) == 0 && ((uintptr_t)x & 15) == 0, what, ": weight / act must be 16 B aligned");
+    cuuint64_t dims[3] = {64, (cuuint64_t)L * W, (cuuint64_t)K / 64}, strides[2] = {(cuuint64_t)K * 2, 128};
+    cuuint32_t box[3] = {64, (cuuint32_t)H_RPC, (cuuint32_t)(K / 64 / KS)}, es[3] = {1, 1, 1};
+    CUresult r = enc(mw, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, (void*)wt, dims, strides, box, es, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                     CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(r == CUDA_SUCCESS, what, " weight tensor map encode failed ", (int)r);
+    cuuint64_t adims[2] = {(cuuint64_t)K, T}, astrides[1] = {(cuuint64_t)K * 2};
+    cuuint32_t abox[2] = {64, 32}, aes[2] = {1, 1};
+    r = enc(ma, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)x, adims, astrides, abox, aes, CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(r == CUDA_SUCCESS, what, " act tensor map encode failed ", (int)r);
+  };
+#endif
+#if PI05_H_UMMA
+  dmaps(&m.wd, &m.act, wd, act, FF, H_KS, "PI05_H_UMMA");
+#endif
+#if PI05_D_UMMA
+  dmaps(&m.wo, &m.attn, wo, attn, QD, PI05_D_UMMA, "PI05_D_UMMA");
+#endif
+  g_fgm_d = wd; g_fgm_act = act; g_fgm_o = wo; g_fgm_attn = attn;
   m.ap = ap;
   m.gate_first = gate_first ? 1 : 0;
   TORCH_CHECK(((uintptr_t)ap & 15) == 0, "Ap must be 16 B aligned");
@@ -3265,7 +3461,13 @@ void launch(std::vector<torch::Tensor> in, torch::Tensor actions, torch::Tensor 
   bf16* ap = (bf16*)(base + o.ap);
 #if PI05_AB_UMMA
   TORCH_CHECK(g_grid == 148, "PI05_AB_UMMA needs 148 CTAs (A on CTAs 108..147)");
-  fg_prepare(p.wg, p.wu, ap, stream, p.wq, p.wk, p.wv);
+#if PI05_H_UMMA
+  TORCH_CHECK(!(fuse & FUSE_HI), "PI05_H_UMMA needs FUSE_HI off (I waits on the H->I barrier)");
+#endif
+#if PI05_D_UMMA
+  TORCH_CHECK(!(fuse & FUSE_DE), "PI05_D_UMMA needs FUSE_DE off (E waits on the D->E barrier)");
+#endif
+  fg_prepare(p.wg, p.wu, ap, stream, p.wq, p.wk, p.wv, p.wd, p.act, p.wo, p.attn);
 #else
   fg_prepare(p.wg, p.wu, ap, stream);
 #endif

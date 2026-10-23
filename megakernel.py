@@ -33,16 +33,17 @@ def parse_variant(variant: str) -> dict:
     ``nopb`` = CUDA built with PI05_PART_BF16=0 (fp32 split-K partials, the pre-job-8802 build),
     ``nofgu`` = CUDA built with PI05_FG_UMMA=0 (mma.sync F + G instead of tcgen05 cta_group::2),
     ``noatt`` = CUDA built with PI05_ATT_K2=0 (split-key attention instead of the K2 units),
-    ``noabu`` = CUDA built with PI05_AB_UMMA=0 (mma.sync A + the B task loop instead of the tcgen05 fused A + B phase).
+    ``noabu`` = CUDA built with PI05_AB_UMMA=0 (mma.sync A + the B task loop instead of the tcgen05 fused A + B phase),
+    ``nohu`` = CUDA built with PI05_H_UMMA=0 (mma.sync gemm_phase H with 32 slabs instead of the tcgen05 H down projection).
     The plain CUDA build is the fastest one: it hoists, spreads, uses bf16 partials, tcgen05 F + G and (PI05_PREFIX 968 only)
-    K2 attention and the tcgen05 fused A + B, all macro defaults, so ``k64`` and ``k64-lh`` are the same CUDA build and every
-    ``no*`` suffix is an A/B control; ``k64-nofgu-noatt`` is the pre-job-9134 default, ``k64-noabu`` the pre-job-9406 one. The CuTe arm reads att_keys and load_hoist only.
+    K2 attention, the tcgen05 fused A + B and the tcgen05 H, all macro defaults, so ``k64`` and ``k64-lh`` are the same CUDA build and every
+    ``no*`` suffix is an A/B control; ``k64-nofgu-noatt`` is the pre-job-9134 default, ``k64-noabu`` the pre-job-9406 one, ``k64-nohu`` the pre-job-9423 one. The CuTe arm reads att_keys and load_hoist only.
     E.g. ``k64-nosp``. Shared by the CUDA and CuTe arms so they cannot drift."""
     keys, *suffixes = variant.split("-")
     if not keys.startswith("k") or not keys[1:].isdigit():
-        raise ValueError(f"bad variant {variant!r}: expected k<att_keys>[-lh|-nolh][-nosp][-nopb][-nofgu][-noatt][-noabu]")
+        raise ValueError(f"bad variant {variant!r}: expected k<att_keys>[-lh|-nolh][-nosp][-nopb][-nofgu][-noatt][-noabu][-nohu]")
     out = {"att_keys": int(keys[1:]), "load_hoist": 0, "hoist_off": False, "spread_off": False, "part_bf16_off": False,
-           "fgu_off": False, "att_k2_off": False, "ab_umma_off": False}
+           "fgu_off": False, "att_k2_off": False, "ab_umma_off": False, "h_umma_off": False}
     if len(set(suffixes)) != len(suffixes):
         raise ValueError(f"duplicate variant suffix in {variant!r}")
     if "lh" in suffixes and "nolh" in suffixes:
@@ -62,6 +63,10 @@ def parse_variant(variant: str) -> dict:
             out["att_k2_off"] = True
         elif suffix == "noabu":
             out["ab_umma_off"] = True
+        elif suffix == "nohu":
+            out["h_umma_off"] = True
+        elif suffix == "hu":
+            raise ValueError(f"suffix 'hu' in {variant!r} is gone: the tcgen05 H is the default since job 9423 (use k64, or -nohu for the control)")
         elif suffix == "abu":
             raise ValueError(f"suffix 'abu' in {variant!r} is gone: the tcgen05 fused A + B is the default since job 9406 "
                              "(use k64, or -noabu for the control)")
@@ -69,7 +74,7 @@ def parse_variant(variant: str) -> dict:
             raise ValueError(f"suffix {suffix!r} in {variant!r} is gone: tcgen05 F + G and K2 attention are the default since "
                              "job 9134 (use k64, or -nofgu / -noatt for the controls)")
         else:
-            raise ValueError(f"bad variant suffix {suffix!r} in {variant!r}: expected lh, nolh, nosp, nopb, nofgu, noatt or noabu")
+            raise ValueError(f"bad variant suffix {suffix!r} in {variant!r}: expected lh, nolh, nosp, nopb, nofgu, noatt, noabu or nohu")
     return out
 
 
@@ -141,6 +146,11 @@ class MegakernelArm:
                         and ((self.fgu and self.att_k2) or "-DPI05_AB_UMMA=1" in extra))
         if pv["ab_umma_off"] and "-DPI05_AB_UMMA=0" not in extra:
             extra = (*extra, "-DPI05_AB_UMMA=0")
+        # tcgen05 H: PI05_H_UMMA defaults to 1 whenever the fused A + B is on (I = fg_E reads its 16 slabs).
+        self.h_umma = (not pv["h_umma_off"] and "-DPI05_H_UMMA=0" not in extra
+                       and (self.ab_umma or "-DPI05_H_UMMA=1" in extra))
+        if pv["h_umma_off"] and "-DPI05_H_UMMA=0" not in extra:
+            extra = (*extra, "-DPI05_H_UMMA=0")
         self.geo = geo
         self.ext = load(geo.prefix, self.att_keys, extra)
         self.device = torch.device(device)
@@ -153,7 +163,7 @@ class MegakernelArm:
         self.actions = torch.empty((geo.horizon, geo.action_dim), dtype=torch.float32,
                                    device=self.device)
         self.tensors: list[torch.Tensor] | None = None
-        self.config = {"att_keys": self.att_keys, "load_hoist": self.load_hoist, "spread": int(self.spread), "part_bf16": int(self.part_bf16), "fg_umma": int(self.fgu), "att_k2": int(self.att_k2), "ab_umma": int(self.ab_umma), "fuse": self.fuse, "prefix": geo.prefix,
+        self.config = {"att_keys": self.att_keys, "load_hoist": self.load_hoist, "spread": int(self.spread), "part_bf16": int(self.part_bf16), "fg_umma": int(self.fgu), "att_k2": int(self.att_k2), "ab_umma": int(self.ab_umma), "h_umma": int(self.h_umma), "fuse": self.fuse, "prefix": geo.prefix,
                        "launches_per_chunk": 1}
 
     def bind(self, inputs: dict) -> None:
