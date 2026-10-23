@@ -32,16 +32,17 @@ def parse_variant(variant: str) -> dict:
     built with PI05_LOAD_HOIST=0 (not with lh), ``nosp`` = CUDA built with PI05_GEMM_SPREAD=0 (slot-major gemm_phase tasks),
     ``nopb`` = CUDA built with PI05_PART_BF16=0 (fp32 split-K partials, the pre-job-8802 build),
     ``nofgu`` = CUDA built with PI05_FG_UMMA=0 (mma.sync F + G instead of tcgen05 cta_group::2),
-    ``noatt`` = CUDA built with PI05_ATT_K2=0 (split-key attention instead of the K2 units).
+    ``noatt`` = CUDA built with PI05_ATT_K2=0 (split-key attention instead of the K2 units),
+    ``noabu`` = CUDA built with PI05_AB_UMMA=0 (mma.sync A + the B task loop instead of the tcgen05 fused A + B phase).
     The plain CUDA build is the fastest one: it hoists, spreads, uses bf16 partials, tcgen05 F + G and (PI05_PREFIX 968 only)
-    K2 attention, all macro defaults, so ``k64`` and ``k64-lh`` are the same CUDA build and every ``no*`` suffix is an A/B
-    control; ``k64-nofgu-noatt`` is the pre-job-9134 default. The CuTe arm reads att_keys and load_hoist only.
+    K2 attention and the tcgen05 fused A + B, all macro defaults, so ``k64`` and ``k64-lh`` are the same CUDA build and every
+    ``no*`` suffix is an A/B control; ``k64-nofgu-noatt`` is the pre-job-9134 default, ``k64-noabu`` the pre-job-9406 one. The CuTe arm reads att_keys and load_hoist only.
     E.g. ``k64-nosp``. Shared by the CUDA and CuTe arms so they cannot drift."""
     keys, *suffixes = variant.split("-")
     if not keys.startswith("k") or not keys[1:].isdigit():
-        raise ValueError(f"bad variant {variant!r}: expected k<att_keys>[-lh|-nolh][-nosp][-nopb][-nofgu][-noatt]")
+        raise ValueError(f"bad variant {variant!r}: expected k<att_keys>[-lh|-nolh][-nosp][-nopb][-nofgu][-noatt][-noabu]")
     out = {"att_keys": int(keys[1:]), "load_hoist": 0, "hoist_off": False, "spread_off": False, "part_bf16_off": False,
-           "fgu_off": False, "att_k2_off": False}
+           "fgu_off": False, "att_k2_off": False, "ab_umma_off": False}
     if len(set(suffixes)) != len(suffixes):
         raise ValueError(f"duplicate variant suffix in {variant!r}")
     if "lh" in suffixes and "nolh" in suffixes:
@@ -59,11 +60,16 @@ def parse_variant(variant: str) -> dict:
             out["fgu_off"] = True
         elif suffix == "noatt":
             out["att_k2_off"] = True
+        elif suffix == "noabu":
+            out["ab_umma_off"] = True
+        elif suffix == "abu":
+            raise ValueError(f"suffix 'abu' in {variant!r} is gone: the tcgen05 fused A + B is the default since job 9406 "
+                             "(use k64, or -noabu for the control)")
         elif suffix in ("fgu", "att"):
             raise ValueError(f"suffix {suffix!r} in {variant!r} is gone: tcgen05 F + G and K2 attention are the default since "
                              "job 9134 (use k64, or -nofgu / -noatt for the controls)")
         else:
-            raise ValueError(f"bad variant suffix {suffix!r} in {variant!r}: expected lh, nolh, nosp, nopb, nofgu or noatt")
+            raise ValueError(f"bad variant suffix {suffix!r} in {variant!r}: expected lh, nolh, nosp, nopb, nofgu, noatt or noabu")
     return out
 
 
@@ -130,6 +136,11 @@ class MegakernelArm:
                        and (geo.prefix == 968 or "-DPI05_ATT_K2=1" in extra))
         if pv["att_k2_off"] and "-DPI05_ATT_K2=0" not in extra:
             extra = (*extra, "-DPI05_ATT_K2=0")
+        # tcgen05 fused A + B: PI05_AB_UMMA defaults to 1 whenever FG_UMMA and ATT_K2 are on (its requirements).
+        self.ab_umma = (not pv["ab_umma_off"] and "-DPI05_AB_UMMA=0" not in extra
+                        and ((self.fgu and self.att_k2) or "-DPI05_AB_UMMA=1" in extra))
+        if pv["ab_umma_off"] and "-DPI05_AB_UMMA=0" not in extra:
+            extra = (*extra, "-DPI05_AB_UMMA=0")
         self.geo = geo
         self.ext = load(geo.prefix, self.att_keys, extra)
         self.device = torch.device(device)
@@ -142,7 +153,7 @@ class MegakernelArm:
         self.actions = torch.empty((geo.horizon, geo.action_dim), dtype=torch.float32,
                                    device=self.device)
         self.tensors: list[torch.Tensor] | None = None
-        self.config = {"att_keys": self.att_keys, "load_hoist": self.load_hoist, "spread": int(self.spread), "part_bf16": int(self.part_bf16), "fg_umma": int(self.fgu), "att_k2": int(self.att_k2), "fuse": self.fuse, "prefix": geo.prefix,
+        self.config = {"att_keys": self.att_keys, "load_hoist": self.load_hoist, "spread": int(self.spread), "part_bf16": int(self.part_bf16), "fg_umma": int(self.fgu), "att_k2": int(self.att_k2), "ab_umma": int(self.ab_umma), "fuse": self.fuse, "prefix": geo.prefix,
                        "launches_per_chunk": 1}
 
     def bind(self, inputs: dict) -> None:
