@@ -288,6 +288,23 @@ constexpr unsigned ARR_DE = 2 * PI05_D_WPT * (QD / KC);  // FUSE_DE arrivals per
 #ifndef PI05_D_UMMA
 #define PI05_D_UMMA 0
 #endif
+// PI05_PF_IDLE (dev, default 0; needs PI05_AB_UMMA; no gain: job 9445, +2.8 .. +3.6% in each of 3 paired .so copies, the prefetch stream competes
+// with A's weight loads): the Wo / prefix K / V and F-weight (wg / wu) L2 prefetches are issued by CTAs 0..107 while
+// they wait at the A->C barrier (A runs on CTAs 108..147), instead of by every CTA after A and between the attention unit and its combine.
+#ifndef PI05_PF_IDLE
+#define PI05_PF_IDLE 0
+#endif
+// PI05_PF_LATE (dev, default 0; the default D path only: PI05_D_WPT > 1, PI05_WPRE & 8): the wg / wu L2 prefetch (between the attention unit and its
+// combine) and the wd / modulation-row prefetch (before D) are issued inside D after the attention->D split barrier's arrive and D's weight
+// cp.async, i.e. while the CTA waits at that barrier, instead of on the unit -> combine -> barrier path.
+#ifndef PI05_PF_LATE
+#define PI05_PF_LATE 0
+#endif
+// PI05_ATT_OBF (dev, default 0; needs PI05_ATT_K2; no gain: job 9454, +1.1 .. +2.5% in each of 3 paired .so copies): the K2 partial O is stored as bf16 (same XOR-permuted 4-element chunks, 8 B each) instead of fp32,
+// halving the unit's opart stores and the combine's opart loads. The (m, l) stats stay fp32.
+#ifndef PI05_ATT_OBF
+#define PI05_ATT_OBF 0
+#endif
 #ifndef PI05_H_UMMA
 #if PI05_AB_UMMA && (PI05_WPRE & 4) && PI05_PART_BF16
 #define PI05_H_UMMA 1
@@ -367,7 +384,9 @@ __device__ __forceinline__ unsigned long long globaltimer() {
 // times are comparable only within one SM.
 #ifdef PI05_FITRACE
 constexpr int FIT_CAP = 32768;  // entries per warp the host buffer must hold (one chunk uses about 14k)
-enum { FIT_BAR = 0, FIT_G0, FIT_WISS, FIT_ADONE, FIT_SYNC, FIT_M0, FIT_MMA, FIT_ST, FIT_WNEXT, FIT_GEND, FIT_CALG, FIT_CALC, FIT_D0 };
+enum { FIT_BAR = 0, FIT_G0, FIT_WISS, FIT_ADONE, FIT_SYNC, FIT_M0, FIT_MMA, FIT_ST, FIT_WNEXT, FIT_GEND, FIT_CALG, FIT_CALC, FIT_D0,
+       FIT_AU0, FIT_ALD, FIT_AQK, FIT_APV, FIT_AREL, FIT_AC0, FIT_ACW, FIT_ACEND,  // K2 attention: unit entry / loads landed / QK + softmax / P.V / released; combine entry / counter / end
+       FIT_AMM };  // K2 attention: QK^T MMAs done (before the softmax)
 __shared__ unsigned long long* fit_cur[NWARPS];
 __device__ __forceinline__ unsigned fit_gtimer() {
   unsigned t;
@@ -590,13 +609,39 @@ __device__ __forceinline__ void wpre_wait(const WPre& w) {
 #endif
 
 // Warm L2 with a weight range that a later phase streams (spread over the grid).
-__device__ __forceinline__ void prefetch_l2(const void* base, size_t bytes) {
+// prefetch_l2 over the first nblk blocks only (blocks >= nblk return): for prefetches issued in a window where only those blocks are idle.
+__device__ __forceinline__ void prefetch_l2_blk(const void* base, size_t bytes, int nblk) {
+  if ((int)blockIdx.x >= nblk) return;
   constexpr size_t CH = 128;
   const size_t n = bytes / CH;
-  const size_t gt = (size_t)blockIdx.x * NTHREADS + threadIdx.x, nt = (size_t)gridDim.x * NTHREADS;
+  const size_t gt = (size_t)blockIdx.x * NTHREADS + threadIdx.x, nt = (size_t)nblk * NTHREADS;
   const char* b = reinterpret_cast<const char*>(base);
 #ifndef PI05_ABL_NOPF
   for (size_t i = gt; i < n; i += nt) asm volatile("prefetch.global.L2 [%0];\n" ::"l"(b + i * CH));
+#endif
+}
+// PI05_BULKPF (dev, default 0; no gain: job 9442, +1.2 .. +2.0% with 3 .so copies per arm, the bulk prefetches share the TMA engine with the phase loads): each block prefetches its contiguous 1 / grid slice of the range with cp.async.bulk.prefetch.L2 (UBLKPF), one 32 KB
+// piece per thread, instead of one prefetch.global.L2 (CCTL) per 128 B line grid-strided over every thread. Base and size must be 16 B multiples.
+#ifndef PI05_BULKPF
+#define PI05_BULKPF 0
+#endif
+__device__ __forceinline__ void prefetch_l2(const void* base, size_t bytes) {
+  const char* b = reinterpret_cast<const char*>(base);
+#ifndef PI05_ABL_NOPF
+#if PI05_BULKPF
+  constexpr size_t PC = 32768;
+  const size_t per = ((bytes + gridDim.x - 1) / gridDim.x + 15) & ~(size_t)15, lo = (size_t)blockIdx.x * per;
+  const size_t hi = lo + per < bytes ? lo + per : bytes;
+  for (size_t o = lo + (size_t)threadIdx.x * PC; o < hi; o += (size_t)NTHREADS * PC) {
+    const uint32_t n = (uint32_t)(hi - o < PC ? hi - o : PC);
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(b + o), "r"(n) : "memory");
+  }
+#else
+  constexpr size_t CH = 128;
+  const size_t n = bytes / CH;
+  const size_t gt = (size_t)blockIdx.x * NTHREADS + threadIdx.x, nt = (size_t)gridDim.x * NTHREADS;
+  for (size_t i = gt; i < n; i += nt) asm volatile("prefetch.global.L2 [%0];\n" ::"l"(b + i * CH));
+#endif
 #endif
 }
 
@@ -904,9 +949,14 @@ __device__ __noinline__ void gemm_phase(const bf16* __restrict__ A, int K, const
 // across the staging: register-resident weights there perturb gemm_phase's codegen, round 10),
 // and the A tile is stored fragment-interleaved so one LDS.128 is one mma A operand.
 constexpr int WS_STRIDE = 40;  // fp32; conflict-free float2 fragment writes and float4 row reads
+struct LatePf { const void* p[4]; size_t n[4]; };  // PI05_PF_LATE: L2 prefetches issued after the split barrier's arrive
 template <int WPT>
 __device__ __noinline__ void gemm_phase_wsplit(const bf16* __restrict__ A, int K, const bf16* __restrict__ Wt, int N,
-                                               float* __restrict__ part, bf16* As WPRE_PARAM, unsigned* cnt = nullptr) {
+                                               float* __restrict__ part, bf16* As WPRE_PARAM, unsigned* cnt = nullptr
+#if PI05_PF_LATE
+                                               , LatePf lpf = LatePf{}
+#endif
+                                               ) {
   // cnt (FUSE_DE): each warp publishes its rows of a 32-column tile on cnt + (n0 / 64) * CNT_STRIDE (2 * WPT arrivals per 64 cols)
   constexpr int NGRP = NWARPS / WPT, NSL = 4 / WPT;
   static_assert(NWARPS % WPT == 0 && 4 % WPT == 0, "warp split");
@@ -944,6 +994,11 @@ __device__ __noinline__ void gemm_phase_wsplit(const bf16* __restrict__ A, int K
   if (wp.bar != nullptr) {
     wpre_arrive(wp);  // the weight buffers are free after the CTA sync (C / C3 are done in this block)
     if (ng < NG) load_w(ng);
+#if PI05_PF_LATE
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      if (lpf.n[i]) prefetch_l2(lpf.p[i], lpf.n[i]);
+#endif
     FIT_EV(FIT_WISS);
     wpre_wait(wp);
     FIT_EV(FIT_BAR);
@@ -2038,6 +2093,7 @@ __device__ __forceinline__ void ak_qk(uint32_t sb, const uint8_t* Mk, float* smx
       mma16816(sc[NTW - 1], a0, a1, a2, a3, b0, b1);
     }
   }
+  FIT_KEV(FIT_AMM);  // through the shared cursor: ak_unit closes its cursor around this call
   float* xm = reinterpret_cast<float*>(smx);
   float* xs = xm + 4 * AK_R;
   float v[NTW][4];
@@ -2094,6 +2150,8 @@ __device__ __noinline__ void ak_unit(AkArgs a, int l) {
   if (tid == 0) red_release(a.cnt + (CNT_ATT + rg) * CNT_STRIDE);
   return;
 #endif
+  FIT_OPEN();
+  FIT_EV(FIT_AU0);
   if (tid < KCN) { const int j = j0 + tid; Mk[tid] = j < P ? (a.mask[j] != 0) : (j < NK); }
   if (tid == 0) {
     asm volatile("fence.proxy.async.global;" ::: "memory");  // generic-proxy writes of the B tasks -> visible to the TMA after the barrier
@@ -2118,9 +2176,15 @@ __device__ __noinline__ void ak_unit(AkArgs a, int l) {
   ak_mbar_wait(sb + AK_OFF_BAR + 8, 0);
 #endif
   __syncthreads();  // loads landed, mask visible
+  FIT_EV(FIT_ALD);
   float* smx = reinterpret_cast<float*>(base + AK_OFF_X);
+  FIT_CLOSE();
   if (tail) ak_qk<2>(sb, Mk, smx, warp, lane); else ak_qk<3>(sb, Mk, smx, warp, lane);
+#ifdef PI05_FITRACE
+  fit_p = fit_cur[threadIdx.x >> 5];
+#endif
   __syncthreads();
+  FIT_EV(FIT_AQK);
   if (tid < AK_R) {  // row stats (m, l): reduce the 4 key-group partials
     const float m = fmaxf(fmaxf(smx[tid], smx[AK_R + tid]), fmaxf(smx[2 * AK_R + tid], smx[3 * AK_R + tid]));
     const float* xs = smx + 4 * AK_R;
@@ -2161,6 +2225,7 @@ __device__ __noinline__ void ak_unit(AkArgs a, int l) {
       }
     }
   }
+  FIT_EV(FIT_APV);
   // ---- partial O -> opart[chunk][row][256] (XOR-permuted float4 chunks)
 #pragma unroll
   for (int mt = 0; mt < 2; ++mt)
@@ -2169,13 +2234,23 @@ __device__ __noinline__ void ak_unit(AkArgs a, int l) {
       const int col = warp * 32 + nt * 8 + 2 * t4;
       const int r0 = mt * 16 + g, r1 = r0 + 8;
       const int rw0 = rg * AK_R + r0, rw1 = rg * AK_R + r1;
+#if PI05_ATT_OBF
+      bf16* const ob = reinterpret_cast<bf16*>(a.opart);
+      if (rw0 < QROWS)
+        *reinterpret_cast<__nv_bfloat162*>(ob + ((size_t)kc * QROWS + rw0) * HD + ((((col >> 2) ^ r0) & 7) | (col >> 2 & ~7)) * 4 + (col & 3)) = __floats2bfloat162_rn(acc[mt][nt][0], acc[mt][nt][1]);
+      if (rw1 < QROWS)
+        *reinterpret_cast<__nv_bfloat162*>(ob + ((size_t)kc * QROWS + rw1) * HD + ((((col >> 2) ^ r1) & 7) | (col >> 2 & ~7)) * 4 + (col & 3)) = __floats2bfloat162_rn(acc[mt][nt][2], acc[mt][nt][3]);
+#else
       if (rw0 < QROWS)
         *reinterpret_cast<float2*>(a.opart + ((size_t)kc * QROWS + rw0) * HD + ((((col >> 2) ^ r0) & 7) | (col >> 2 & ~7)) * 4 + (col & 3)) = make_float2(acc[mt][nt][0], acc[mt][nt][1]);
       if (rw1 < QROWS)
         *reinterpret_cast<float2*>(a.opart + ((size_t)kc * QROWS + rw1) * HD + ((((col >> 2) ^ r1) & 7) | (col >> 2 & ~7)) * 4 + (col & 3)) = make_float2(acc[mt][nt][2], acc[mt][nt][3]);
+#endif
     }
   __syncthreads();
   if (tid == 0) red_release(a.cnt + (CNT_ATT + rg) * CNT_STRIDE);
+  FIT_EV(FIT_AREL);
+  FIT_CLOSE();
 }
 
 // combine: CTA (rg, kc) takes rows k = kc + 11 s (s = 0..2) of its own row group once the row group's 11 units have released; thread = (slot, column quad)
@@ -2185,14 +2260,25 @@ __device__ __noinline__ void ak_combine(AkArgs a, unsigned it1) {
   if (blockIdx.x >= AK_NUNIT) return;
   int rg, kc; ak_map_of(blockIdx.x, rg, kc);
   const int slot = tid >> 6, cq = tid & 63, k = kc + AK_NCH * slot, row = rg * AK_R + k;
+  FIT_OPEN();
+  FIT_EV(FIT_AC0);
   block_wait(a.cnt + (CNT_ATT + rg) * CNT_STRIDE, it1 * AK_NCH, a.backoff > 0);
+  FIT_EV(FIT_ACW);
 #ifndef PI05_NULL_ATT  // dev-only: the combine's loads, exp / fma and attn store skipped (the counter wait above is kept)
   if (k < AK_R && row < QROWS) {
     const float2* st = reinterpret_cast<const float2*>(a.stats + (size_t)row * AK_NCH * 2);
     float4 o[AK_NCH];
     float wgt[AK_NCH], ls[AK_NCH];
 #pragma unroll
+#if PI05_ATT_OBF
+    for (int c = 0; c < AK_NCH; ++c) {
+      const uint2 v = __ldcg(reinterpret_cast<const uint2*>(reinterpret_cast<const bf16*>(a.opart) + ((size_t)c * QROWS + row) * HD + ((cq ^ row) & 7 | (cq & ~7)) * 4));
+      const float2 lo = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v.x)), hi = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v.y));
+      o[c] = make_float4(lo.x, lo.y, hi.x, hi.y);
+    }
+#else
     for (int c = 0; c < AK_NCH; ++c) o[c] = __ldcg(reinterpret_cast<const float4*>(a.opart + ((size_t)c * QROWS + row) * HD + ((cq ^ row) & 7 | (cq & ~7)) * 4));
+#endif
 #pragma unroll
     for (int c = 0; c < AK_NCH; ++c) { const float2 v = __ldcg(st + c); wgt[c] = v.x; ls[c] = v.y; }
     float M = wgt[0];
@@ -2212,6 +2298,8 @@ __device__ __noinline__ void ak_combine(AkArgs a, unsigned it1) {
 #if PI05_D_UMMA
   asm volatile("fence.proxy.async.global;" ::: "memory");  // attn (generic-proxy stores) -> D's act TMA after the attention->D barrier
 #endif
+  FIT_EV(FIT_ACEND);
+  FIT_CLOSE();
 }
 #endif  // PI05_ATT_K2
 
@@ -2457,9 +2545,19 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       // ---- B (no barrier): once a head's 64 tiles have arrived, reduce, BF16 round, RoPE.
       // Tasks (head, 10-row slice) go to the highest block indices, which QKV leaves idle.
       PF_B(0);
+#if PI05_PF_IDLE
+      // CTAs 0..AB_A0-1 wait at the A->C barrier while A runs on AB_A0..147: they issue Wo / prefix K / V and the F weights (wg / wu, formerly
+      // issued between the attention unit and its combine) here; the A CTAs skip them.
+      prefetch_l2_blk(p.wo + (size_t)l * W * QD, (size_t)W * QD * 2, AB_A0);
+      prefetch_l2_blk(p.prefix_k + (size_t)l * P * HD, (size_t)P * HD * 2, AB_A0);
+      prefetch_l2_blk(p.prefix_v + (size_t)l * P * HD, (size_t)P * HD * 2, AB_A0);
+      prefetch_l2_blk(p.wg + (size_t)l * FF * W, (size_t)FF * W * 2, AB_A0);
+      prefetch_l2_blk(p.wu + (size_t)l * FF * W, (size_t)FF * W * 2, AB_A0);
+#else
       prefetch_l2(p.wo + (size_t)l * W * QD, (size_t)W * QD * 2);
       prefetch_l2(p.prefix_k + (size_t)l * P * HD, (size_t)P * HD * 2);
       prefetch_l2(p.prefix_v + (size_t)l * P * HD, (size_t)P * HD * 2);
+#endif
       PF_E(0);
 #if PI05_ATT_K2
 #ifndef PI05_NULL_ATT
@@ -2910,8 +3008,10 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       // out = sum_c e^(m_c-M) o_c / sum_c e^(m_c-M) l_c. Tasks of 4 rows go to the
       // highest block indices, which attention leaves idle.
       PF_B(1);
+#if !PI05_PF_IDLE && !PI05_PF_LATE  // PI05_PF_IDLE: issued by the idle CTAs during A; PI05_PF_LATE: inside D
       prefetch_l2(p.wg + (size_t)l * FF * W, (size_t)FF * W * 2);
       prefetch_l2(p.wu + (size_t)l * FF * W, (size_t)FF * W * 2);
+#endif
       PF_E(1);
 #if PI05_ATT_K2
       ak_combine(ak, it1);  // owner-sliced: CTAs 0..142 combine their own row group (needs FUSE_CC3, checked on the host)
@@ -2974,8 +3074,16 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       // ---- D: o_proj. Warm wd (the shorter E no longer hides it) and the modulation rows
       // of norms 2l, 2l+1 (E gate, F staging scale/shift, I gate), long evicted by the weights.
       PF_B(2);
+#if PI05_PF_LATE
+#if !(PI05_D_WPT > 1 && (PI05_WPRE & 8)) || PI05_D_UMMA || PI05_PF_IDLE || defined(PI05_D_CTL) || defined(PI05_NULL_D)
+#error "PI05_PF_LATE needs the default D path (gemm_phase_wsplit with the split barrier)"
+#endif
+      const LatePf lpf{{p.wg + (size_t)l * FF * W, p.wu + (size_t)l * FF * W, p.wd + (size_t)l * W * FF, modstep + (size_t)(2 * l) * 3 * W},
+                       {(size_t)FF * W * 2, (size_t)FF * W * 2, (size_t)W * FF * 2, (size_t)6 * W * 4}};
+#else
       prefetch_l2(p.wd + (size_t)l * W * FF, (size_t)W * FF * 2);
       prefetch_l2(modstep + (size_t)(2 * l) * 3 * W, (size_t)6 * W * 4);
+#endif
       PF_E(2);
 #if PI05_D_WPT > 1 && defined(PI05_D_CTL)
       // Dev control (never in production): the split path is compiled but D runs gemm_phase.
@@ -2990,7 +3098,11 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
 #elif PI05_D_UMMA
       umma_down<QD, PI05_D_UMMA>(p.part, &fgm.wo, &fgm.attn, l, wpre(), smb);
 #elif PI05_D_WPT > 1 && (PI05_WPRE & 8)
-      gemm_phase_wsplit<PI05_D_WPT>(p.attn, QD, p.wo + (size_t)l * W * QD, W, p.part, smb, wpre(), de ? p.cnt + CNT_DE * CNT_STRIDE : nullptr);
+      gemm_phase_wsplit<PI05_D_WPT>(p.attn, QD, p.wo + (size_t)l * W * QD, W, p.part, smb, wpre(), de ? p.cnt + CNT_DE * CNT_STRIDE : nullptr
+#if PI05_PF_LATE
+                                    , lpf
+#endif
+      );
 #elif PI05_D_WPT > 1
       gemm_phase_wsplit<PI05_D_WPT>(p.attn, QD, p.wo + (size_t)l * W * QD, W, p.part, smb);
 #else
