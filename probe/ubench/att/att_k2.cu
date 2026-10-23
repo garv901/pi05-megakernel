@@ -14,6 +14,7 @@
 // (the rows of their own row group, row = rg * 32 + kc + 11 * s), after the row group's 11 units have released the counter.
 //
 // Variant flags (K2_LIST): TMA loads (else cp.async into the same swizzled layout), PRE (prefix K/V issued in B_pre, before the B tasks; else all in C),
+// PP: two-half software-pipelined unit (QK half 1 overlaps the row-max exchange, PV half 0 overlaps the half-1 softmax; half 1 uses the half-0 max, CTA-uniform fallback to the full path), EX2: p = ex2(fma(v, log2e, -m*log2e)).
 // BULK (partial O staged in smem and written by one cp.async.bulk (1-D TMA store) instead of per-thread float2 stores).
 // Build (login node): ./build.sh att_k2 -DATT_HOOKS      (stamped, _ns, _mk twins)       Run: att_k2 --variants null,k0,k2_...,calib --smem 197632 --cluster 2
 #include <cudaTypedefs.h>
@@ -29,7 +30,7 @@ template <class VT> int att_main_unused(int, char**) { return 0; }  // att_k0.cu
 #undef main
 
 // ------------------------------------------------------------------------------------------------ variant table
-constexpr int F_TMA = 1, F_PRE = 2, F_BULK = 4, F_LDQ = 8, F_FEXP = 16, F_V4 = 32, F_LL = 64, F_LLG = 128, F_PAIR = 256, F_PMAP = 512, F_BF = 1024, F_BFH = 2048, F_BFC = 4096;  // BFC: coalesced combine: stats [kc][row], combine warp = (octet, half), lane = row of the group (k1's mapping); else rows k = kc + 11 s, lane = octet  // PAIR: cluster-pair (CTA 2i, 2i+1 = same row group, adjacent key chunks) exchange half the partial O over DSMEM (st.async + mbarrier) and merge before the global partial store
+constexpr int F_TMA = 1, F_PRE = 2, F_BULK = 4, F_LDQ = 8, F_FEXP = 16, F_V4 = 32, F_LL = 64, F_LLG = 128, F_PAIR = 256, F_PMAP = 512, F_BF = 1024, F_BFH = 2048, F_BFC = 4096, F_PP = 8192, F_EX2 = 16384;  // BFC: coalesced combine: stats [kc][row], combine warp = (octet, half), lane = row of the group (k1's mapping); else rows k = kc + 11 s, lane = octet  // PAIR: cluster-pair (CTA 2i, 2i+1 = same row group, adjacent key chunks) exchange half the partial O over DSMEM (st.async + mbarrier) and merge before the global partial store
 // (LL: see below)  // LL: no counter / release - partial O and stats carry an 8-bit epoch tag in the low mantissa byte of every fp32, consumers poll the data (LLG: stats first)  // LDQ: q (and the tail's suffix K/V) by ld.global -> st.shared instead of TMA / cp.async
 #ifndef K2_MASK
 #define K2_MASK 0x1f0fff
@@ -58,7 +59,10 @@ constexpr int F_TMA = 1, F_PRE = 2, F_BULK = 4, F_LDQ = 8, F_FEXP = 16, F_V4 = 3
   X(19, "k2_tma_bf", F_TMA | F_PRE | F_BF | F_BFC) \
   X(20, "k2_tma_bf_h", F_TMA | F_PRE | F_BF | F_BFC | F_BFH) \
   X(21, "k2_tma_bfr", F_TMA | F_PRE | F_BF) \
-  X(22, "k2_tma_bfr_h", F_TMA | F_PRE | F_BF | F_BFH)
+  X(22, "k2_tma_bfr_h", F_TMA | F_PRE | F_BF | F_BFH) \
+  X(23, "k2_tma_ex2", F_TMA | F_PRE | F_EX2) \
+  X(24, "k2_pp", F_TMA | F_PRE | F_PP) \
+  X(25, "k2_pp_ex2", F_TMA | F_PRE | F_PP | F_EX2)
 static const char* att_ext_vname(int v) {
 #define X(i, n, fl) if (v == ATTV_EXT + i) return n;
   K2_LIST(X)
@@ -107,6 +111,20 @@ __device__ __forceinline__ void ldsm_x4a(uint32_t& r0, uint32_t& r1, uint32_t& r
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a)); }
 __device__ __forceinline__ void ldsm_x4t(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, uint32_t a) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a)); }
+#ifndef PP_THR
+#define PP_THR 8.0f          // log2 units
+#endif
+#ifndef PP_QREG
+#define PP_QREG 1
+#endif
+constexpr uint32_t OFF_PMX = OFF_BAR + 24, OFF_PP0 = OFF_BAR + 32, OFF_PP1 = OFF_BAR + 40, OFF_PFB = OFF_BAR + 48;
+__device__ unsigned g_k2_pp_fb;
+__device__ __forceinline__ void mbar_arrive(uint32_t b) { asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(b) : "memory"); }
+__device__ __forceinline__ void warp_arrive(uint32_t b, int lane) { __syncwarp(); if (lane == 0) mbar_arrive(b); }
+template <int FL> __device__ __forceinline__ float k2_exp(float v, float ms, float msl) {
+  if (FL & F_EX2) { float e; asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(fmaf(v, 1.4426950408889634f, -msl))); return e; }
+  return expf(v - ms);
+}
 __device__ __forceinline__ void cp16s(uint32_t dst, const void* g, int nb) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(g), "r"(nb) : "memory"); }
 
@@ -299,7 +317,8 @@ __device__ __forceinline__ void k2_qk(uint32_t sb, const uint8_t* Mk, float* smx
     float pr[4];
 #pragma unroll
     for (int e = 0; e < 4; ++e) {
-      if (FL & F_FEXP) { float ee; asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(ee) : "f"((v[n][e] - ms[e >> 1]) * 1.4426950408889634f)); pr[e] = rbf(ee); }
+      if (FL & F_EX2) pr[e] = rbf(k2_exp<FL>(v[n][e], ms[e >> 1], ms[e >> 1] * 1.4426950408889634f));
+      else if (FL & F_FEXP) { float ee; asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(ee) : "f"((v[n][e] - ms[e >> 1]) * 1.4426950408889634f)); pr[e] = rbf(ee); }
       else pr[e] = rbf(expf(v[n][e] - ms[e >> 1]));
       ls[e >> 1] += pr[e];
     }
@@ -313,6 +332,147 @@ __device__ __forceinline__ void k2_qk(uint32_t sb, const uint8_t* Mk, float* smx
     ls[h] += __shfl_xor_sync(0xffffffffu, ls[h], 2);
   }
   if (t4 == 0) { xs[kg * R2 + ra] = ls[0]; xs[kg * R2 + rb] = ls[1]; }
+}
+
+// ---- two-half pipelined unit (F_PP)
+template <int NT, bool LOADQ>
+__device__ __forceinline__ void pp_qk(float (&s)[NT][4], uint32_t (&qa)[16][4], uint32_t aBase, uint32_t kBase, int bn, int lane) {
+  const int x = lane & 7;
+#pragma unroll
+  for (int n = 0; n < NT; ++n)
+#pragma unroll
+    for (int e = 0; e < 4; ++e) s[n][e] = 0.f;
+#pragma unroll
+  for (int kk = 0; kk < HD / 16; ++kk) {
+    if (LOADQ || !PP_QREG) ldsm_x4a(qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], aBase + (kk >> 2) * QBLK + (((((kk & 3) * 2 + (lane >> 4)) ^ x) & 7) << 4));
+#pragma unroll
+    for (int np = 0; np < NT / 2; ++np) {
+      const int krow = (bn + 2 * np) * 8 + (lane >> 4) * 8 + x;
+      uint32_t b0, b1, b2, b3;
+      ldsm_x4a(b0, b1, b2, b3, kBase + (kk >> 2) * KBLK + krow * 128 + (((((kk & 3) * 2 + ((lane >> 3) & 1)) ^ x) & 7) << 4));
+      mma16816(s[2 * np], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], b0, b1);
+      mma16816(s[2 * np + 1], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], b2, b3);
+    }
+    if (NT & 1) {
+      const int krow = (bn + NT - 1) * 8 + x;
+      uint32_t b0, b1;
+      ldsm_x2(b0, b1, kBase + (kk >> 2) * KBLK + krow * 128 + (((((kk & 3) * 2 + ((lane >> 3) & 1)) ^ x) & 7) << 4));
+      mma16816(s[NT - 1], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], b0, b1);
+    }
+  }
+}
+template <int KS0, int KS1>
+__device__ __forceinline__ void pp_pv(float (&acc)[2][4][4], uint32_t sb, int warp, int lane) {
+  const int x = lane & 7;
+  const uint32_t pBase = sb + OFF_S + ((x + ((lane >> 3) & 1) * 8) * SS_STRIDE + (lane >> 4) * 8) * 2;
+  const uint32_t vBase = sb + OFF_V;
+#pragma unroll
+  for (int ks = KS0; ks < KS1; ++ks) {
+    uint32_t pa[2][4];
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) ldsm_x4a(pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3], pBase + (mt * 16 * SS_STRIDE + ks * 16) * 2);
+    const int krow = ks * 16 + x + ((lane >> 3) & 1) * 8;
+#pragma unroll
+    for (int np = 0; np < 2; ++np) {
+      const int ch = (warp & 1) * 4 + np * 2 + (lane >> 4);
+      uint32_t b0, b1, b2, b3;
+      ldsm_x4t(b0, b1, b2, b3, vBase + (warp >> 1) * KBLK + krow * 128 + (((ch ^ x) & 7) << 4));
+#pragma unroll
+      for (int mt = 0; mt < 2; ++mt) {
+        mma16816(acc[mt][2 * np], pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3], b0, b1);
+        mma16816(acc[mt][2 * np + 1], pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3], b2, b3);
+      }
+    }
+  }
+}
+// returns fb (CTA-uniform): true -> acc / S / xm / xs are NOT valid, the caller reruns the full path
+template <int FL, int N0, int N1>
+__device__ __forceinline__ bool k2_pp(uint32_t sb, const uint8_t* Mk, float* smx, int warp, int lane, float (&acc)[2][4][4]) {
+  const int mt = warp & 1, kg = warp >> 1, g = lane >> 2, t4 = lane & 3, x = lane & 7;
+  const int bn0 = kg * N0, bn1 = 4 * N0 + kg * N1;
+  const uint32_t aBase = sb + OFF_Q + (mt * 16 + x + ((lane >> 3) & 1) * 8) * 128;
+  const uint32_t kBase = sb + OFF_K;
+  const int ra = mt * 16 + g, rb = ra + 8;
+  float* xm = smx;
+  float* xs = xm + 4 * R2;
+  uint32_t qa[16][4];
+  float s0[N0][4], s1[N1][4];
+  pp_qk<N0, true>(s0, qa, aBase, kBase, bn0, lane);
+  float v0[N0][4];
+  float lm[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+  for (int n = 0; n < N0; ++n) {
+    const int col = (bn0 + n) * 8 + 2 * t4;
+#pragma unroll
+    for (int e = 0; e < 4; ++e) { v0[n][e] = Mk[col + (e & 1)] ? rbf(s0[n][e]) * 0.0625f : -INFINITY; lm[e >> 1] = fmaxf(lm[e >> 1], v0[n][e]); }
+  }
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    lm[h] = fmaxf(lm[h], __shfl_xor_sync(0xffffffffu, lm[h], 1));
+    lm[h] = fmaxf(lm[h], __shfl_xor_sync(0xffffffffu, lm[h], 2));
+  }
+  if (t4 == 0) { xm[kg * R2 + ra] = lm[0]; xm[kg * R2 + rb] = lm[1]; }
+  warp_arrive(sb + OFF_PMX, lane);
+  pp_qk<N1, false>(s1, qa, aBase, kBase, bn1, lane);
+  mbar_wait(sb + OFF_PMX, 0);
+  float mr[2];
+  mr[0] = fmaxf(fmaxf(xm[ra], xm[R2 + ra]), fmaxf(xm[2 * R2 + ra], xm[3 * R2 + ra]));
+  mr[1] = fmaxf(fmaxf(xm[rb], xm[R2 + rb]), fmaxf(xm[2 * R2 + rb], xm[3 * R2 + rb]));
+  const float ms[2] = {mr[0] == -INFINITY ? 0.f : mr[0], mr[1] == -INFINITY ? 0.f : mr[1]};
+  const float msl[2] = {ms[0] * 1.4426950408889634f, ms[1] * 1.4426950408889634f};
+  float ls[2] = {0.f, 0.f};
+#pragma unroll
+  for (int n = 0; n < N0; ++n) {
+    const int col = (bn0 + n) * 8 + 2 * t4;
+    float pr[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) { pr[e] = rbf(k2_exp<FL>(v0[n][e], ms[e >> 1], msl[e >> 1])); ls[e >> 1] += pr[e]; }
+    const __nv_bfloat162 lo = __floats2bfloat162_rn(pr[0], pr[1]), hi = __floats2bfloat162_rn(pr[2], pr[3]);
+    asm volatile("st.shared.b32 [%0], %1;" ::"r"(sb + OFF_S + (ra * SS_STRIDE + col) * 2), "r"(*reinterpret_cast<const uint32_t*>(&lo)) : "memory");
+    asm volatile("st.shared.b32 [%0], %1;" ::"r"(sb + OFF_S + (rb * SS_STRIDE + col) * 2), "r"(*reinterpret_cast<const uint32_t*>(&hi)) : "memory");
+  }
+  warp_arrive(sb + OFF_PP0, lane);
+  mbar_wait(sb + OFF_PP0, 0);
+#pragma unroll
+  for (int a = 0; a < 2; ++a)
+#pragma unroll
+    for (int b = 0; b < 4; ++b)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) acc[a][b][e] = 0.f;
+  pp_pv<0, 2 * N0>(acc, sb, warp, lane);
+  bool bad = false;
+#ifdef K2_PP_FORCE_FB
+  bad = true;
+#endif
+  const float thr = PP_THR * 0.69314718f;
+#pragma unroll
+  for (int n = 0; n < N1; ++n) {
+    const int col = (bn1 + n) * 8 + 2 * t4;
+    float pr[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      const float v = Mk[col + (e & 1)] ? rbf(s1[n][e]) * 0.0625f : -INFINITY;
+      const int h = e >> 1;
+      bad |= (v > ms[h] + thr) || (mr[h] == -INFINITY && v != -INFINITY);
+      pr[e] = rbf(k2_exp<FL>(v, ms[h], msl[h])); ls[h] += pr[e];
+    }
+    const __nv_bfloat162 lo = __floats2bfloat162_rn(pr[0], pr[1]), hi = __floats2bfloat162_rn(pr[2], pr[3]);
+    asm volatile("st.shared.b32 [%0], %1;" ::"r"(sb + OFF_S + (ra * SS_STRIDE + col) * 2), "r"(*reinterpret_cast<const uint32_t*>(&lo)) : "memory");
+    asm volatile("st.shared.b32 [%0], %1;" ::"r"(sb + OFF_S + (rb * SS_STRIDE + col) * 2), "r"(*reinterpret_cast<const uint32_t*>(&hi)) : "memory");
+  }
+  if (bad) asm volatile("st.shared.u32 [%0], %1;" ::"r"(sb + OFF_PFB), "r"(1u) : "memory");
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    ls[h] += __shfl_xor_sync(0xffffffffu, ls[h], 1);
+    ls[h] += __shfl_xor_sync(0xffffffffu, ls[h], 2);
+  }
+  if (t4 == 0) { xs[kg * R2 + ra] = ls[0]; xs[kg * R2 + rb] = ls[1]; }
+  warp_arrive(sb + OFF_PP1, lane);
+  mbar_wait(sb + OFF_PP1, 0);
+  uint32_t fb;
+  asm volatile("ld.shared.u32 %0, [%1];" : "=r"(fb) : "r"(sb + OFF_PFB) : "memory");
+  if (!fb) pp_pv<2 * N0, 2 * N0 + 2 * N1>(acc, sb, warp, lane);
+  return fb != 0;
 }
 
 // ---- one unit
@@ -360,28 +520,7 @@ __device__ __noinline__ void k2_unit(UA u, int l, int it, ull* mk) {
 #ifndef K2_QMARK
   ATT_MARK(mk, 1);
 #endif
-  // ---- QK^T + fused softmax -> P (bf16, smem); row stats
-  float* smx = reinterpret_cast<float*>(base + OFF_X);
   const unsigned tag = k2_tag(it);
-  if (tail) k2_qk<FL, 2>(sb, Mk, smx, warp, lane, tag); else k2_qk<FL, 3>(sb, Mk, smx, warp, lane, tag);
-  ATT_MARK(mk, 2);
-  __syncthreads();
-  if (tid < R2) {  // row stats (m, l): reduce the 4 key-group partials
-    float m = fmaxf(fmaxf(smx[tid], smx[R2 + tid]), fmaxf(smx[2 * R2 + tid], smx[3 * R2 + tid]));
-    const float* xs = smx + 4 * R2;
-    float l = (xs[tid] + xs[R2 + tid]) + (xs[2 * R2 + tid] + xs[3 * R2 + tid]);
-    if (FL & F_LL) { m = k2_tagf(m == -INFINITY ? -1e30f : m, tag); l = k2_tagf(l, tag); }
-    const int row = rg * R2 + tid;
-    if ((FL & F_PAIR) && !tail) {  // keep own (m, l) in smem, send them to the partner's smem (merged stats go to global after the O merge)
-      reinterpret_cast<float2*>(base + OFF_ML)[tid] = make_float2(m, l);
-      const uint32_t pr = (uint32_t)(blockIdx.x & 1) ^ 1u;
-      st_async2(mapa_u32(sb + OFF_RS + tid * 8, pr), m, l, mapa_u32(sb + OFF_RB, pr));
-    } else if (row < QROWS) *reinterpret_cast<float2*>(u.stats + ((FL & F_BFC) ? ((size_t)kc * QROWS + row) : ((size_t)row * NCH2 + kc)) * 2) = make_float2(m, l);
-  }
-#ifndef K2_PROBE
-  ATT_MARK(mk, 3);
-#endif
-  // ---- P.V: warp w = dims [32w, 32w + 32), both m-tiles
   float acc[2][4][4];
 #pragma unroll
   for (int mt = 0; mt < 2; ++mt)
@@ -389,30 +528,80 @@ __device__ __noinline__ void k2_unit(UA u, int l, int it, ull* mk) {
     for (int nt = 0; nt < 4; ++nt)
 #pragma unroll
       for (int e = 0; e < 4; ++e) acc[mt][nt][e] = 0.f;
-  {
-    const uint32_t pBase = sb + OFF_S + ((x + ((lane >> 3) & 1) * 8) * SS_STRIDE + (lane >> 4) * 8) * 2;
-    const uint32_t vBase = sb + OFF_V;
-    const int nks = KC / 16;
-#pragma unroll
-    for (int ks = 0; ks < KP2 / 16; ++ks) {
-      if (ks < nks) {
-        uint32_t pa[2][4];
-#pragma unroll
-        for (int mt = 0; mt < 2; ++mt) ldsm_x4a(pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3], pBase + (mt * 16 * SS_STRIDE + ks * 16) * 2);
-        const int krow = ks * 16 + x + ((lane >> 3) & 1) * 8;
-#pragma unroll
-        for (int np = 0; np < 2; ++np) {
-          const int ch = (warp & 1) * 4 + np * 2 + (lane >> 4);
-          uint32_t b0, b1, b2, b3;
-          ldsm_x4t(b0, b1, b2, b3, vBase + (warp >> 1) * KBLK + krow * 128 + (((ch ^ x) & 7) << 4));
-#pragma unroll
-          for (int mt = 0; mt < 2; ++mt) {
-            mma16816(acc[mt][2 * np], pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3], b0, b1);
-            mma16816(acc[mt][2 * np + 1], pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3], b2, b3);
+  static_assert(!(FL & F_PP) || ((FL & F_PRE) && !(FL & (F_PAIR | F_LL | F_BF | F_PMAP))), "F_PP needs PRE (barrier init) and the plain unit");
+  if constexpr (!(FL & F_PP)) {
+    // ---- QK^T + fused softmax -> P (bf16, smem); row stats
+    float* smx = reinterpret_cast<float*>(base + OFF_X);
+    if (tail) k2_qk<FL, 2>(sb, Mk, smx, warp, lane, tag); else k2_qk<FL, 3>(sb, Mk, smx, warp, lane, tag);
+    ATT_MARK(mk, 2);
+    __syncthreads();
+    if (tid < R2) {  // row stats (m, l): reduce the 4 key-group partials
+      float m = fmaxf(fmaxf(smx[tid], smx[R2 + tid]), fmaxf(smx[2 * R2 + tid], smx[3 * R2 + tid]));
+      const float* xs = smx + 4 * R2;
+      float l = (xs[tid] + xs[R2 + tid]) + (xs[2 * R2 + tid] + xs[3 * R2 + tid]);
+      if (FL & F_LL) { m = k2_tagf(m == -INFINITY ? -1e30f : m, tag); l = k2_tagf(l, tag); }
+      const int row = rg * R2 + tid;
+      if ((FL & F_PAIR) && !tail) {  // keep own (m, l) in smem, send them to the partner's smem (merged stats go to global after the O merge)
+        reinterpret_cast<float2*>(base + OFF_ML)[tid] = make_float2(m, l);
+        const uint32_t pr = (uint32_t)(blockIdx.x & 1) ^ 1u;
+        st_async2(mapa_u32(sb + OFF_RS + tid * 8, pr), m, l, mapa_u32(sb + OFF_RB, pr));
+      } else if (row < QROWS) *reinterpret_cast<float2*>(u.stats + ((FL & F_BFC) ? ((size_t)kc * QROWS + row) : ((size_t)row * NCH2 + kc)) * 2) = make_float2(m, l);
+    }
+  #ifndef K2_PROBE
+    ATT_MARK(mk, 3);
+  #endif
+    // ---- P.V: warp w = dims [32w, 32w + 32), both m-tiles
+    {
+      const uint32_t pBase = sb + OFF_S + ((x + ((lane >> 3) & 1) * 8) * SS_STRIDE + (lane >> 4) * 8) * 2;
+      const uint32_t vBase = sb + OFF_V;
+      const int nks = KC / 16;
+  #pragma unroll
+      for (int ks = 0; ks < KP2 / 16; ++ks) {
+        if (ks < nks) {
+          uint32_t pa[2][4];
+  #pragma unroll
+          for (int mt = 0; mt < 2; ++mt) ldsm_x4a(pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3], pBase + (mt * 16 * SS_STRIDE + ks * 16) * 2);
+          const int krow = ks * 16 + x + ((lane >> 3) & 1) * 8;
+  #pragma unroll
+          for (int np = 0; np < 2; ++np) {
+            const int ch = (warp & 1) * 4 + np * 2 + (lane >> 4);
+            uint32_t b0, b1, b2, b3;
+            ldsm_x4t(b0, b1, b2, b3, vBase + (warp >> 1) * KBLK + krow * 128 + (((ch ^ x) & 7) << 4));
+  #pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+              mma16816(acc[mt][2 * np], pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3], b0, b1);
+              mma16816(acc[mt][2 * np + 1], pa[mt][0], pa[mt][1], pa[mt][2], pa[mt][3], b2, b3);
+            }
           }
         }
       }
     }
+  } else {
+    float* smx = reinterpret_cast<float*>(base + OFF_X);
+    const bool fb = tail ? k2_pp<FL, 1, 1>(sb, Mk, smx, warp, lane, acc) : k2_pp<FL, 2, 1>(sb, Mk, smx, warp, lane, acc);
+    if (fb) {
+      if (tid == 0) atomicAdd(&g_k2_pp_fb, 1u);
+#pragma unroll
+      for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+          for (int e = 0; e < 4; ++e) acc[mt][nt][e] = 0.f;
+      __syncthreads();
+      if (tail) k2_qk<FL & ~F_PP, 2>(sb, Mk, smx, warp, lane, 0); else k2_qk<FL & ~F_PP, 3>(sb, Mk, smx, warp, lane, 0);
+      __syncthreads();
+      if (tail) pp_pv<0, 4>(acc, sb, warp, lane); else pp_pv<0, 6>(acc, sb, warp, lane);
+    }
+    ATT_MARK(mk, 2);
+    __syncthreads();
+    if (tid < R2) {
+      const float m = fmaxf(fmaxf(smx[tid], smx[R2 + tid]), fmaxf(smx[2 * R2 + tid], smx[3 * R2 + tid]));
+      const float* xs = smx + 4 * R2;
+      const float l = (xs[tid] + xs[R2 + tid]) + (xs[2 * R2 + tid] + xs[3 * R2 + tid]);
+      const int row = rg * R2 + tid;
+      if (row < QROWS) *reinterpret_cast<float2*>(u.stats + ((size_t)row * NCH2 + kc) * 2) = make_float2(m, l);
+    }
+    ATT_MARK(mk, 3);
   }
 #ifndef K2_DBGM
   ATT_MARK(mk, 4);
@@ -734,6 +923,7 @@ struct K2 {
       const int cnt = (tail && !(FL & F_LDQ)) ? 2 : 1;
       mbar_init(sb + OFF_BAR, cnt); mbar_init(sb + OFF_BAR + 8, cnt); mbar_init(sb + OFF_BAR + 16, 1);
       if (FL & F_PAIR) { mbar_init(sb + OFF_RB, 1); mbar_expect(sb + OFF_RB, 4 * 256 * 16 + 256); }
+      if (FL & F_PP) { mbar_init(sb + OFF_PMX, 8); mbar_init(sb + OFF_PP0, 8); mbar_init(sb + OFF_PP1, 8); *reinterpret_cast<volatile uint32_t*>(u.smem + OFF_PFB) = 0u; }
       asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // earlier phases used this smem through the generic proxy
     }
@@ -803,11 +993,13 @@ struct K2 {
     mk(a.ksuf, T, 56, c_tmKs, "Ksuf");
     mk(a.vsuf, T, 56, c_tmVs, "Vsuf");
     mk(a.q, QROWS, R2, c_tmQ, "Q");
-    unsigned z = 0; CK(cudaMemcpyToSymbol(g_k2_to, &z, 4));
+    unsigned z = 0; CK(cudaMemcpyToSymbol(g_k2_to, &z, 4)); CK(cudaMemcpyToSymbol(g_k2_pp_fb, &z, 4));
     fprintf(stderr, "k2 prepare: grid=%d units=%d smem=%zu\n", grid, NUNIT2, (size_t)kSmem);
   }
   static void post_run(int variant, int idx, int reps, const std::string& out, const std::string& name, double nspc) {
     unsigned to = 0; CK(cudaMemcpyFromSymbol(&to, g_k2_to, 4));
+    unsigned fbn = 0; CK(cudaMemcpyFromSymbol(&fbn, g_k2_pp_fb, 4));
+    if (fbn) { fprintf(stderr, "PPFB %u (variant %s launch %d)\n", fbn, att_vname(variant), idx); unsigned z = 0; CK(cudaMemcpyToSymbol(g_k2_pp_fb, &z, 4)); }
     if (to) { fprintf(stderr, "WARNING: %u mbarrier wait timeouts (variant %s launch %d)\n", to, att_vname(variant), idx); unsigned z = 0; CK(cudaMemcpyToSymbol(g_k2_to, &z, 4)); }
   }
 };
