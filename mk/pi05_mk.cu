@@ -158,10 +158,13 @@ constexpr int CNT_STRIDE = 32;                 // one 128B line per counter
 constexpr int CNT_QKV = 0;                     // 10 heads (8 q, k, v): 8 groups x 8 K chunks
 constexpr int CNT_ATT = 16;                    // ATT_NRG (5 or 7) query row groups: ATT_NCHUNK key chunks
 constexpr int CNT_GU = 32;                     // 128 gate/up 32-col groups: 2 groups x 8 K chunks
-constexpr int NCNT = CNT_GU + FF / 32;
+constexpr int CNT_HI = CNT_GU + FF / 32;      // FUSE_HI: 16 down-proj 64-col groups: 2 tiles x 32 K chunks
+constexpr int CNT_DE = CNT_HI + W / 64;       // FUSE_DE: 16 o-proj 64-col groups: 2 tiles x D_WPT warps x 16 K chunks
+constexpr int NCNT = CNT_DE + W / 64;
 constexpr unsigned ARR_QKV = (HD / 32) * (W / KC);
 constexpr unsigned ARR_ATT = ATT_NCHUNK;
 constexpr unsigned ARR_GU = 2 * (W / KC);
+constexpr unsigned ARR_HI = 2 * (FF / KC);
 constexpr int FUSE_AB = 1, FUSE_CC3 = 2, FUSE_FG = 4, FUSE_BACKOFF = 8;
 #if PI05_ATT_K2
 static_assert(AK_NUNIT <= 148 && AK_NRG <= CNT_GU - CNT_ATT, "PI05_ATT_K2 units / counters");
@@ -169,6 +172,8 @@ static_assert(AK_NUNIT <= 148 && AK_NRG <= CNT_GU - CNT_ATT, "PI05_ATT_K2 units 
 // Non-final residuals run as grid-parallel (row, column group) tasks and the next
 // GEMM normalizes h while staging A (no xn, no row-local block_sum).
 constexpr int FUSE_DEFNORM = 16;
+constexpr int FUSE_HI = 32, FUSE_DE = 64;  // FUSE_DE: D -> E likewise (PI05_D_WPT > 1 with PI05_WPRE & 8 only)
+constexpr int FUSE_HI_ = 32;  // H -> I by per-64-col-group counters (deferred-norm I only), no H -> I grid barrier
 constexpr int NSSP = W / 64;  // sum-of-squares parts per row (64-column residual tasks)
 
 // Grid barrier primitive (dev arms, round 7): 0 = cg grid.sync; 1 = flat epoch flags (one 128B
@@ -199,6 +204,7 @@ constexpr int NSSP = W / 64;  // sum-of-squares parts per row (64-column residua
 #ifndef PI05_D_WPT
 #define PI05_D_WPT 2
 #endif
+constexpr unsigned ARR_DE = 2 * PI05_D_WPT * (QD / KC);  // FUSE_DE arrivals per 64-col group per layer
 // gemm_phase A tile layout (round 11): 0 = row-major [64][AS_STRIDE] (each mma A operand assembled
 // from two LDS.128 by register MOVs); 1 = fragment-interleaved as in gemm_phase_wsplit (one LDS.128 =
 // one A operand, 4-way bank-conflicted 32-bit staging stores); 2 = same tile, thread tid stages rows
@@ -323,15 +329,26 @@ __device__ __forceinline__ unsigned long long globaltimer() {
 // fit[1 + k * grid * NWARPS + block * NWARPS + w], fit[0] = {nblocks, NWARPS}. Tag: bits 0-1 type (2 = instant),
 // 2-11 event (FIT_* below), 12-23 block * NWARPS + warp, 24-31 smid. Inside a function the cursor is a
 // register (FlashInfer's closure); between calls it lives in fit_cur. PI05_FITRACE=2 adds FlashInfer's
-// __threadfence_block() on both sides of every entry; 1 has none.
+// __threadfence_block() on both sides of every entry; 1 has none; 3 = as 1 with the low 32 bits of clock64 (SM cycles)
+// instead of globaltimer_lo (a globaltimer read right after a barrier is stale by 1-2 us, U11). Mode 3 adds per-warp
+// calibration entries at kernel entry and exit (FIT_CALG = globaltimer_lo, FIT_CALC = clock lo) for ns / cycle; its
+// times are comparable only within one SM.
 #ifdef PI05_FITRACE
 constexpr int FIT_CAP = 32768;  // entries per warp the host buffer must hold (one chunk uses about 14k)
-enum { FIT_BAR = 0, FIT_G0, FIT_WISS, FIT_ADONE, FIT_SYNC, FIT_M0, FIT_MMA, FIT_ST, FIT_WNEXT, FIT_GEND };
+enum { FIT_BAR = 0, FIT_G0, FIT_WISS, FIT_ADONE, FIT_SYNC, FIT_M0, FIT_MMA, FIT_ST, FIT_WNEXT, FIT_GEND, FIT_CALG, FIT_CALC, FIT_D0 };
 __shared__ unsigned long long* fit_cur[NWARPS];
-__device__ __forceinline__ unsigned fit_timer() {
+__device__ __forceinline__ unsigned fit_gtimer() {
   unsigned t;
   asm volatile("mov.u32 %0, %globaltimer_lo;" : "=r"(t));
   return t;
+}
+__device__ __forceinline__ unsigned fit_ctimer() { return (unsigned)clock64(); }
+__device__ __forceinline__ unsigned fit_timer() {
+#if PI05_FITRACE == 3
+  return fit_ctimer();
+#else
+  return fit_gtimer();
+#endif
 }
 __device__ __forceinline__ unsigned fit_tag_base() {
   unsigned sm;
@@ -358,11 +375,28 @@ __device__ __forceinline__ unsigned fit_tag_base() {
 #define FIT_CLOSE() do { if ((threadIdx.x & 31) == 0) fit_cur[threadIdx.x >> 5] = fit_p; } while (0)
 // One entry through the shared cursor (outside an open function).
 #define FIT_KEV(ev) do { FIT_OPEN(); FIT_EV(ev); FIT_CLOSE(); } while (0)
+// Mode 3 calibration pair (globaltimer_lo, clock lo) through the shared cursor.
+#if PI05_FITRACE == 3
+#define FIT_CAL()                                                                                       \
+  do {                                                                                                  \
+    FIT_OPEN();                                                                                         \
+    if (fit_p != nullptr && (threadIdx.x & 31) == 0) {                                                  \
+      const unsigned g = fit_gtimer(), c = fit_ctimer();                                                \
+      fit_p[0] = ((unsigned long long)g << 32) | (fit_tag | ((unsigned)FIT_CALG << 2));                 \
+      fit_p[fit_stride] = ((unsigned long long)c << 32) | (fit_tag | ((unsigned)FIT_CALC << 2));        \
+      fit_p += 2 * fit_stride;                                                                          \
+    }                                                                                                   \
+    FIT_CLOSE();                                                                                        \
+  } while (0)
+#else
+#define FIT_CAL() do {} while (0)
+#endif
 #else
 #define FIT_OPEN() do {} while (0)
 #define FIT_EV(ev) do {} while (0)
 #define FIT_CLOSE() do {} while (0)
 #define FIT_KEV(ev) do {} while (0)
+#define FIT_CAL() do {} while (0)
 #endif
 
 // ---------------------------------------------------------------- helpers
@@ -425,6 +459,20 @@ __device__ __forceinline__ void block_wait(const unsigned* c, unsigned target, b
   __syncthreads();
 }
 
+#ifndef PI05_BAR_SLEEP
+#define PI05_BAR_SLEEP 0  // grid barrier poll backoff (ns, 0 = none)
+#endif
+// One warp waits until *c >= target (lane 0 spins relaxed, one acquire fence, warp barrier): block_wait for warp tasks.
+__device__ __forceinline__ void group_wait(const unsigned* c, unsigned target, bool backoff) {
+  if ((threadIdx.x & 31) == 0) {
+    while (ld_relaxed(c) < target) {
+      if (backoff) __nanosleep(64);
+    }
+    asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+  }
+  __syncwarp();
+}
+
 #if PI05_BARRIER
 __device__ __forceinline__ void st_release(unsigned* ptr, unsigned v) {
   asm volatile("st.release.gpu.global.u32 [%0], %1;\n" ::"l"(ptr), "r"(v) : "memory");
@@ -439,6 +487,8 @@ __device__ __forceinline__ void spin_acquire(const unsigned* ptr, unsigned targe
 #ifdef PI05_BAR_DEBUG
   unsigned n = 0;
   while ((int)(ld_acquire(ptr) - target) < 0) if (++n > (1u << 26)) __trap();
+#elif PI05_BAR_SLEEP
+  while ((int)(ld_acquire(ptr) - target) < 0) __nanosleep(PI05_BAR_SLEEP);  // U13 v2: -25..-45 ns / barrier in the silo
 #else
   while ((int)(ld_acquire(ptr) - target) < 0) {}
 #endif
@@ -824,7 +874,8 @@ __device__ __noinline__ void gemm_phase(const bf16* __restrict__ A, int K, const
 constexpr int WS_STRIDE = 40;  // fp32; conflict-free float2 fragment writes and float4 row reads
 template <int WPT>
 __device__ __noinline__ void gemm_phase_wsplit(const bf16* __restrict__ A, int K, const bf16* __restrict__ Wt, int N,
-                                               float* __restrict__ part, bf16* As WPRE_PARAM) {
+                                               float* __restrict__ part, bf16* As WPRE_PARAM, unsigned* cnt = nullptr) {
+  // cnt (FUSE_DE): each warp publishes its rows of a 32-column tile on cnt + (n0 / 64) * CNT_STRIDE (2 * WPT arrivals per 64 cols)
   constexpr int NGRP = NWARPS / WPT, NSL = 4 / WPT;
   static_assert(NWARPS % WPT == 0 && 4 % WPT == 0, "warp split");
   // smem: A tile (16 KB interleaved, in the 64 x AS_STRIDE area), partials [warp][T][WS_STRIDE], weights.
@@ -855,15 +906,21 @@ __device__ __noinline__ void gemm_phase_wsplit(const bf16* __restrict__ A, int K
     asm volatile("cp.async.commit_group;\n" ::: "memory");
   };
 
+  FIT_OPEN();
+  FIT_EV(FIT_D0);
 #if PI05_WPRE
   if (wp.bar != nullptr) {
     wpre_arrive(wp);  // the weight buffers are free after the CTA sync (C / C3 are done in this block)
     if (ng < NG) load_w(ng);
+    FIT_EV(FIT_WISS);
     wpre_wait(wp);
-    FIT_KEV(FIT_BAR);
+    FIT_EV(FIT_BAR);
   } else
 #endif
-  if (ng < NG) load_w(ng);
+  {
+    if (ng < NG) load_w(ng);
+    FIT_EV(FIT_WISS);
+  }
   {
     constexpr int PIECES = 64 * (KC / 8);
     uint4 av[PIECES / NTHREADS];
@@ -885,8 +942,10 @@ __device__ __noinline__ void gemm_phase_wsplit(const bf16* __restrict__ A, int K
       Ai[base + 32 * 4 + 2] = av[x].w;
     }
   }
+  FIT_EV(FIT_ADONE);
   asm volatile("cp.async.wait_group 0;\n" ::: "memory");
   __syncthreads();
+  FIT_EV(FIT_SYNC);
   for (; ng < NG; ng += ng_step) {  // uniform within a group (ng depends on gi only)
     float acc[4][4][4];
 #pragma unroll
@@ -912,9 +971,13 @@ __device__ __noinline__ void gemm_phase_wsplit(const bf16* __restrict__ A, int K
         }
       }
     }
+    FIT_EV(FIT_MMA);
     const int n0 = ng * 32;
     __syncwarp();
-    if (ng + ng_step < NG) load_w(ng + ng_step);  // own buffer, already read into registers
+    if (ng + ng_step < NG) {
+      load_w(ng + ng_step);  // own buffer, already read into registers
+      FIT_EV(FIT_WNEXT);
+    }
 #pragma unroll
     for (int mt = 0; mt < 4; ++mt)
 #pragma unroll
@@ -944,11 +1007,18 @@ __device__ __noinline__ void gemm_phase_wsplit(const bf16* __restrict__ A, int K
 #endif
       }
     }
+    FIT_EV(FIT_ST);
+    if (cnt != nullptr) {
+      __syncwarp();
+      if (lane == 0) red_release(cnt + (n0 / 64) * CNT_STRIDE);
+    }
     if (ng + ng_step < NG) {
       asm volatile("cp.async.wait_group 0;\n" ::: "memory");
       asm volatile("bar.sync %0, %1;\n" ::"r"(1 + gi), "r"(32 * WPT) : "memory");
     }
   }
+  FIT_EV(FIT_GEND);
+  FIT_CLOSE();
 }
 
 template <int S>
@@ -1134,11 +1204,14 @@ __device__ void residual_row(const Params& p, int t, const float* gate, const fl
 // columns (float2 partials, split-K order as residual_row, so h is unchanged) and
 // ssp[t][c] gets the group's sum of squares. The consumer GEMM applies the norm while
 // staging A (gemm_phase norm mode), summing the NSSP parts in order.
+// cnt (FUSE_HI): the task's lane 0 first waits for its 64-column group's counter (cnt + group * CNT_STRIDE) to reach target.
 template <int S>
-__device__ __forceinline__ void residual_tasks(const Params& p, const float* gate) {
+__device__ __forceinline__ void residual_tasks(const Params& p, const float* gate, const unsigned* cnt = nullptr,
+                                               unsigned target = 0, bool backoff = false) {
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   for (int task = warp * gridDim.x + (gridDim.x - 1 - blockIdx.x); task < T * NSSP; task += gridDim.x * NWARPS) {
     const int t = task / NSSP, c = (task % NSSP) * 64 + lane * 2;
+    if (cnt != nullptr) group_wait(cnt + (task % NSSP) * CNT_STRIDE, target, backoff);
     float2 x[S];
 #pragma unroll
 #if PI05_PART_BF16
@@ -1165,7 +1238,8 @@ __device__ __forceinline__ void residual_tasks(const Params& p, const float* gat
 // (row t, 64-column group) over all blocks: each lane computes two adjacent columns (k-order of
 // action_in_row) and ssp[t][group] gets the group's sum of squares (layout of residual_tasks), so the
 // next A GEMM stages the attention norm. xsrc = noise (step 0, also copied to xbuf) or xbuf.
-__device__ __forceinline__ void action_in_task(const Params& p, int t, int gi, const float* xs, bool smem_x) {
+__device__ __forceinline__ void action_in_task(const Params& p, int t, int gi, const float* xs, bool smem_x
+                                               ) {
   const int lane = threadIdx.x & 31;
   const int n = gi * 64 + lane * 2;
   float4 xv[ADIM / 4], w0[ADIM / 4], w1[ADIM / 4];
@@ -1190,11 +1264,13 @@ __device__ __forceinline__ void action_in_task(const Params& p, int t, int gi, c
   if (lane == 0) p.ssp[t * NSSP + gi] = ss;
 }
 
-__device__ __forceinline__ void action_in_tasks(const Params& p, const float* xsrc, bool copy_x) {
+__device__ __forceinline__ void action_in_tasks(const Params& p, const float* xsrc, bool copy_x
+                                                ) {
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   for (int task = warp * gridDim.x + (gridDim.x - 1 - blockIdx.x); task < T * NSSP; task += gridDim.x * NWARPS) {
     const int t = task / NSSP, gi = task % NSSP;
-    action_in_task(p, t, gi, xsrc, false);
+    action_in_task(p, t, gi, xsrc, false
+                   );
     if (copy_x && gi == 0) p.xbuf[t * ADIM + lane] = __ldcg(xsrc + t * ADIM + lane);
   }
 }
@@ -1266,7 +1342,8 @@ __device__ __forceinline__ void action_out_tasks(const Params& p, const float* f
 #else
 // Fused tail, one block per row t: final norm, all 32 action_out dims (4 per warp), Euler, then
 // action_in of the row (warp w -> 64-column groups 2w, 2w + 1) and its ssp; no barrier in between.
-__device__ __forceinline__ void action_tail_rows(const Params& p, const float* fmod, float* hn, bool last_step) {
+__device__ __forceinline__ void action_tail_rows(const Params& p, const float* fmod, float* hn, bool last_step
+                                                 ) {
   const int warp = threadIdx.x >> 5;
   float* xs = hn + W;
   for (int t = blockIdx.x; t < T; t += gridDim.x) {
@@ -1276,7 +1353,8 @@ __device__ __forceinline__ void action_tail_rows(const Params& p, const float* f
     __syncthreads();  // xs complete
     if (!last_step) {
 #pragma unroll 1
-      for (int gi = warp * 2; gi < warp * 2 + 2; ++gi) action_in_task(p, t, gi, xs, true);
+      for (int gi = warp * 2; gi < warp * 2 + 2; ++gi) action_in_task(p, t, gi, xs, true
+                                                                      );
     }
     __syncthreads();  // hn / xs reuse
   }
@@ -1372,10 +1450,12 @@ static_assert(NSSP == 16 && W == 1024 && FF == 4096 && FF / 32 == FG_NCTA, "FG_U
 // (the MMA then produces W . shift in a token column for free). Ap row r: token t (t < 31), t + 1 (t >= 31: the pair's B halves are rows 0..31 and
 // 32..51); rows 31 and 51 hold the shift (the last column of each half).
 template <int S>
-__device__ __forceinline__ void fg_E(const Params& p, const FgMaps& m, const float* gate, const float* modF) {
+__device__ __forceinline__ void fg_E(const Params& p, const FgMaps& m, const float* gate, const float* modF,
+                                     const unsigned* cnt = nullptr, unsigned target = 0, bool backoff = false) {
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   for (int task = warp * gridDim.x + (gridDim.x - 1 - blockIdx.x); task < T * NSSP; task += gridDim.x * NWARPS) {
     const int t = task / NSSP, c = (task % NSSP) * 64 + lane * 2;
+    if (cnt != nullptr) group_wait(cnt + (task % NSSP) * CNT_STRIDE, target, backoff);
     const float2 sc = __ldcg(reinterpret_cast<const float2*>(modF + c));  // issued with the other loads
     float2 x[S];
 #pragma unroll
@@ -1515,6 +1595,7 @@ __device__ __noinline__ void fg_F(const Params& p, const CUtensorMap* tmW, const
   if (warp == 1) { fence_after(); tmem_free64c2(tb); }
 }
 #endif  // PI05_FG_UMMA
+
 
 #if PI05_ATT_K2
 // ------------------------------------------------------------- PI05_ATT_K2: attention units (TMA + mma.sync) and the owner-sliced combine
@@ -1806,6 +1887,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
     fit_cur[threadIdx.x >> 5] = p.fit != nullptr ? p.fit + 1 + blockIdx.x * NWARPS + (threadIdx.x >> 5) : nullptr;
   if (p.fit != nullptr && blockIdx.x == 0 && threadIdx.x == 0) p.fit[0] = ((unsigned long long)NWARPS << 32) | gridDim.x;
   __syncwarp();
+  FIT_CAL();
 #endif
 #ifdef PI05_PTRACE
 #define PT_A() do { __syncthreads(); if (p.ptr != nullptr && threadIdx.x == 0) \
@@ -1959,8 +2041,9 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
   prefetch_l2(p.wk, (size_t)KVD * W * 2);
   prefetch_l2(p.wv, (size_t)KVD * W * 2);
 #if PI05_TAIL
-  if (p.fuse & FUSE_DEFNORM) action_in_tasks(p, p.noise, true);
-  else
+  if (p.fuse & FUSE_DEFNORM) {
+    action_in_tasks(p, p.noise, true);
+  } else
 #endif
   {
     float* xs = smf;
@@ -2519,6 +2602,11 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       SYNC();
 #endif
       CST(10);
+#if PI05_D_WPT > 1 && (PI05_WPRE & 8) && !defined(PI05_D_CTL)
+      const bool de = defnorm && (p.fuse & FUSE_DE);  // E waits on per-group counters instead of the D -> E barrier
+#else
+      const bool de = false;
+#endif
       // ---- D: o_proj. Warm wd (the shorter E no longer hides it) and the modulation rows
       // of norms 2l, 2l+1 (E gate, F staging scale/shift, I gate), long evicted by the weights.
       PF_B(2);
@@ -2530,20 +2618,21 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       if (p.fuse & 1024) gemm_phase_wsplit<PI05_D_WPT>(p.attn, QD, p.wo + (size_t)l * W * QD, W, p.part, smb);
       else gemm_phase(p.attn, QD, p.wo + (size_t)l * W * QD, W, nullptr, W, nullptr, W, p.part, smb);
 #elif PI05_D_WPT > 1 && (PI05_WPRE & 8)
-      gemm_phase_wsplit<PI05_D_WPT>(p.attn, QD, p.wo + (size_t)l * W * QD, W, p.part, smb, wpre());
+      gemm_phase_wsplit<PI05_D_WPT>(p.attn, QD, p.wo + (size_t)l * W * QD, W, p.part, smb, wpre(), de ? p.cnt + CNT_DE * CNT_STRIDE : nullptr);
 #elif PI05_D_WPT > 1
       gemm_phase_wsplit<PI05_D_WPT>(p.attn, QD, p.wo + (size_t)l * W * QD, W, p.part, smb);
 #else
       gemm_phase(p.attn, QD, p.wo + (size_t)l * W * QD, W, nullptr, W, nullptr, W, p.part, smb);
 #endif
       STOP_AT(4)
-      SYNC();
+      if (!de) SYNC();
       // ---- E: gated residual, FFN adaRMS.
+      const unsigned* dec = de ? p.cnt + CNT_DE * CNT_STRIDE : nullptr;
       if (defnorm) {
 #if PI05_FG_UMMA
-        fg_E<QD / KC>(p, fgm, modstep + (size_t)(2 * l) * 3 * W + 2 * W, modstep + (size_t)(2 * l + 1) * 3 * W);
+        fg_E<QD / KC>(p, fgm, modstep + (size_t)(2 * l) * 3 * W + 2 * W, modstep + (size_t)(2 * l + 1) * 3 * W, dec, it1 * ARR_DE, backoff);
 #else
-        residual_tasks<QD / KC>(p, modstep + (size_t)(2 * l) * 3 * W + 2 * W);
+        residual_tasks<QD / KC>(p, modstep + (size_t)(2 * l) * 3 * W + 2 * W, dec, it1 * ARR_DE, backoff);
 #endif
       } else {
         for (int t = blockIdx.x; t < T; t += gridDim.x) {
@@ -2638,13 +2727,16 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       // ---- H: down projection (warm the next norm's modulation row for I and the next A).
       // (WPRE 4: this prefetch is issued before the barrier, which runs inside gemm_phase.)
       prefetch_l2(modstep + (size_t)(2 * (l + 1)) * 3 * W, (size_t)3 * W * 4);
-      gemm_phase(p.act, FF, p.wd + (size_t)l * W * FF, W, nullptr, W, nullptr, W, p.part, smb
+      const bool hi = defnorm && (p.fuse & FUSE_HI);  // I waits on per-group counters instead of the H -> I barrier
+      gemm_phase(p.act, FF, p.wd + (size_t)l * W * FF, W, nullptr, W, nullptr, W, p.part, smb,
+                 hi ? p.cnt + CNT_HI * CNT_STRIDE : nullptr, 64, W / 64
 #if PI05_WPRE & 4
-                 , nullptr, 1, 1, nullptr, nullptr, wpre()
+                 , nullptr, nullptr, wpre()
 #endif
                  );
       STOP_AT(8)
-      SYNC();
+      if (!hi) SYNC();
+      const unsigned* hic = hi ? p.cnt + CNT_HI * CNT_STRIDE : nullptr;
       // ---- I: gated residual, next norm (or final norm, action_out, Euler update, next action_in).
       {
         const bool last = (l == L - 1);
@@ -2653,7 +2745,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
         if (defnorm && last) {
           prefetch_l2(p.action_out_w, (size_t)ADIM * W * 4);
           prefetch_l2(p.action_in_w, (size_t)W * ADIM * 4);
-          residual_tasks<FF / KC>(p, modstep + (size_t)(2 * l + 1) * 3 * W + 2 * W);
+          residual_tasks<FF / KC>(p, modstep + (size_t)(2 * l + 1) * 3 * W + 2 * W, hic, it1 * ARR_HI, backoff);
           SYNC();
           const bool more = step + 1 < p.n_steps;
 #if PI05_TAIL == 1
@@ -2669,7 +2761,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
         } else
 #endif
         if (defnorm && !last) {
-          residual_tasks<FF / KC>(p, modstep + (size_t)(2 * l + 1) * 3 * W + 2 * W);
+          residual_tasks<FF / KC>(p, modstep + (size_t)(2 * l + 1) * 3 * W + 2 * W, hic, it1 * ARR_HI, backoff);
           a_nmod = nextmod;
         } else {
           for (int t = blockIdx.x; t < T; t += gridDim.x) {
@@ -2691,6 +2783,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
 #if PI05_WPRE & 1
   if (a_pend) SYNC();  // truncated (debug) runs end on this barrier, as without WPRE
 #endif
+  FIT_CAL();
 }
 
 // ------------------------------------------------------------- host side
@@ -2969,7 +3062,7 @@ std::string build_config() {
 #define PI05_CFG(name) s += #name "=" PI05_STR(name) " ";
   PI05_CFG(PI05_FG_UMMA) PI05_CFG(PI05_LOAD_HOIST) PI05_CFG(PI05_GEMM_SPREAD) PI05_CFG(PI05_PART_BF16) PI05_CFG(PI05_WPRE)
   PI05_CFG(PI05_BARRIER) PI05_CFG(PI05_D_WPT) PI05_CFG(PI05_ATT_FA) PI05_CFG(PI05_TAIL) PI05_CFG(PI05_ATT_KEYS) PI05_CFG(PI05_PREFIX)
-  PI05_CFG(PI05_ATT_PREFILL) PI05_CFG(PI05_TILE_ROT) PI05_CFG(PI05_ATT_K2)
+  PI05_CFG(PI05_ATT_PREFILL) PI05_CFG(PI05_TILE_ROT) PI05_CFG(PI05_ATT_K2) PI05_CFG(PI05_BAR_SLEEP)
 #undef PI05_CFG
 #ifdef PI05_NULL_ATT
   s += "NULL_ATT ";
