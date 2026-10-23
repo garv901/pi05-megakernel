@@ -300,6 +300,12 @@ constexpr unsigned ARR_DE = 2 * PI05_D_WPT * (QD / KC);  // FUSE_DE arrivals per
 #ifndef PI05_PF_LATE
 #define PI05_PF_LATE 0
 #endif
+// PI05_ATT_EX2 (dev, default 0; needs PI05_ATT_K2): the K2 softmax exp is ex2.approx.ftz with log2(e) folded into one FFMA (p = 2^(v log2e - m log2e))
+// instead of expf. Port of probe/ubench/att/att_k2.cu k2_tma_ex2 (silo job 9467: -0.10 .. -0.15 us/layer vs k2_tma). No gain in situ: job 9469,
+// +1.44 / +1.27 / -0.68% in 3 paired .so copies.
+#ifndef PI05_ATT_EX2
+#define PI05_ATT_EX2 0
+#endif
 // PI05_ATT_OBF (dev, default 0; needs PI05_ATT_K2; no gain: job 9454, +1.1 .. +2.5% in each of 3 paired .so copies): the K2 partial O is stored as bf16 (same XOR-permuted 4-element chunks, 8 B each) instead of fp32,
 // halving the unit's opart stores and the combine's opart loads. The (m, l) stats stay fp32.
 #ifndef PI05_ATT_OBF
@@ -2116,13 +2122,24 @@ __device__ __forceinline__ void ak_qk(uint32_t sb, const uint8_t* Mk, float* smx
   mr[0] = fmaxf(fmaxf(xm[ra], xm[AK_R + ra]), fmaxf(xm[2 * AK_R + ra], xm[3 * AK_R + ra]));
   mr[1] = fmaxf(fmaxf(xm[rb], xm[AK_R + rb]), fmaxf(xm[2 * AK_R + rb], xm[3 * AK_R + rb]));
   const float ms[2] = {mr[0] == -INFINITY ? 0.f : mr[0], mr[1] == -INFINITY ? 0.f : mr[1]};
+#if PI05_ATT_EX2
+  const float msl[2] = {ms[0] * 1.4426950408889634f, ms[1] * 1.4426950408889634f};
+#endif
   float ls[2] = {0.f, 0.f};
 #pragma unroll
   for (int n = 0; n < NTW; ++n) {
     const int col = (bn0 + n) * 8 + 2 * t4;
     float pr[4];
 #pragma unroll
+#if PI05_ATT_EX2
+    for (int e = 0; e < 4; ++e) {
+      float ee;
+      asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(ee) : "f"(fmaf(v[n][e], 1.4426950408889634f, -msl[e >> 1])));
+      pr[e] = rbf(ee); ls[e >> 1] += pr[e];
+    }
+#else
     for (int e = 0; e < 4; ++e) { pr[e] = rbf(expf(v[n][e] - ms[e >> 1])); ls[e >> 1] += pr[e]; }
+#endif
     const __nv_bfloat162 lo = __floats2bfloat162_rn(pr[0], pr[1]), hi = __floats2bfloat162_rn(pr[2], pr[3]);
     asm volatile("st.shared.b32 [%0], %1;" ::"r"(sb + AK_OFF_S + (ra * AK_SS + col) * 2), "r"(*reinterpret_cast<const uint32_t*>(&lo)) : "memory");
     asm volatile("st.shared.b32 [%0], %1;" ::"r"(sb + AK_OFF_S + (rb * AK_SS + col) * 2), "r"(*reinterpret_cast<const uint32_t*>(&hi)) : "memory");
