@@ -160,7 +160,7 @@ constexpr int CNT_ATT = 16;                    // ATT_NRG (5 or 7) query row gro
 constexpr int CNT_GU = 32;                     // 128 gate/up 32-col groups: 2 groups x 8 K chunks
 constexpr int CNT_HI = CNT_GU + FF / 32;      // FUSE_HI: 16 down-proj 64-col groups: 2 tiles x 32 K chunks
 constexpr int CNT_DE = CNT_HI + W / 64;       // FUSE_DE: 16 o-proj 64-col groups: 2 tiles x D_WPT warps x 16 K chunks
-constexpr int NCNT = CNT_DE + W / 64;
+constexpr int CNT_FH = CNT_DE + W / 64;       // PI05_FH_CNT: 16 down-proj K slices (256 act columns = 8 F tiles each)
 constexpr unsigned ARR_QKV = (HD / 32) * (W / KC);
 constexpr unsigned ARR_ATT = ATT_NCHUNK;
 constexpr unsigned ARR_GU = 2 * (W / KC);
@@ -318,14 +318,40 @@ constexpr unsigned ARR_DE = 2 * PI05_D_WPT * (QD / KC);  // FUSE_DE arrivals per
 #define PI05_H_UMMA 0
 #endif
 #endif
+// PI05_FH_CNT (default 1 with PI05_H_UMMA since job 20510; 0 = the F->H grid barrier, control): H waits on per-K-slice counters, not on the F->H
+// grid barrier. GeGLU is elementwise, so F tile t writes final act columns 32 t .. 32 t + 31, and H K slice ks (256 columns) reads only F tiles
+// 8 ks .. 8 ks + 7. Each F tile releases counter CNT_FH + t / 8 after its act stores. H waits for 8 releases per layer on its own slice; CTAs
+// 128..147 skip H and wait at the H->I barrier. Job 20510 (with PI05_BAR_NEAR 4 and the tcgen05 / barrier changes marked "job 20510" below, 4 .so
+// copies each): 5.64 ms vs 6.16 ms (-8.6%) at P = 968.
+#ifndef PI05_FH_CNT
+#define PI05_FH_CNT PI05_H_UMMA
+#endif
+#if PI05_FH_CNT && !PI05_H_UMMA
+#error "PI05_FH_CNT needs PI05_H_UMMA"
+#endif
+constexpr int NCNT = CNT_FH + (PI05_FH_CNT ? FF / 256 : 0);  // the CNT_FH counters exist only with PI05_FH_CNT
 // Debug-only per-block attention sub-phase stamps (round 8): CST_N globaltimer values per
 // (step, layer, block) written after the 4096-entry tstamp area. Never set in production.
 #ifdef PI05_CSTAMP
 constexpr int CST_N = 12;
 #endif
+// PI05_BAR_NEAR (default 4 with the counter barrier since job 20510; 1 = one counter, control): N copies of the grid-barrier counter, 4 KB apart
+// after the counter line. Arrive = one fence.acq_rel.gpu + one relaxed red per copy. At kernel start, thread 0 of each CTA times dependent loads of
+// each copy and then polls only the fastest one. B200 has two L2 halves, so with one counter about half of the CTAs poll a line in the far half.
+#ifndef PI05_BAR_NEAR
+#if PI05_BARRIER == 3
+#define PI05_BAR_NEAR 4
+#else
+#define PI05_BAR_NEAR 1
+#endif
+#endif
+#if PI05_BAR_NEAR > 1 && PI05_BARRIER != 3
+#error "PI05_BAR_NEAR > 1 needs the counter barrier (PI05_BARRIER 3)"
+#endif
 #if PI05_BARRIER
 constexpr int BAR_STRIDE = 32;              // u32 words per flag (one 128B line)
-constexpr int BAR_WORDS = 160 * BAR_STRIDE + 2 * BAR_STRIDE;  // flags, then one generation/counter line
+constexpr int BAR_NEAR_STRIDE = 1024;       // u32 words between counter copies (4 KB)
+constexpr int BAR_WORDS = 160 * BAR_STRIDE + 2 * BAR_STRIDE + (PI05_BAR_NEAR > 1 ? PI05_BAR_NEAR * BAR_NEAR_STRIDE : 0);  // flags, counter line, copies
 #endif
 
 struct Params {
@@ -500,18 +526,36 @@ __device__ __forceinline__ unsigned ld_relaxed(const unsigned* ptr) {
   asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(ptr) : "memory");
   return v;
 }
+__device__ __forceinline__ unsigned ld_acquire(const unsigned* ptr) {
+  unsigned v;
+  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(ptr) : "memory");
+  return v;
+}
 __device__ __forceinline__ void red_release(unsigned* ptr) {
   asm volatile("red.release.gpu.global.add.u32 [%0], 1;\n" ::"l"(ptr) : "memory");
 }
-// Whole block waits until *c >= target: thread 0 spins relaxed, then one acquire
-// fence; the CTA barrier extends it to the block. Releases come from one thread
-// after a warp/CTA barrier over the published stores (CUTLASS semaphore pattern).
+#if PI05_BAR_NEAR > 1
+__shared__ unsigned bar_near_k;  // the counter copy that thread 0 of this CTA polls (chosen at kernel start)
+// Copy k of the grid-barrier counter cnt (= bar + 160 * BAR_STRIDE). Copy 0 is cnt. Copies 1.. start after the 2-line counter area.
+__device__ __forceinline__ unsigned* bar_copy(const unsigned* cnt, unsigned k) {
+  return const_cast<unsigned*>(cnt) + (k == 0 ? 0 : 2 * BAR_STRIDE + k * BAR_NEAR_STRIDE);
+}
+// fence.acq_rel + one relaxed red per copy = a release add on every copy. The CTA barrier before the call collects the writes of the CTA.
+__device__ __forceinline__ void bar_arrive_all(const unsigned* cnt) {
+  asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+#pragma unroll
+  for (unsigned k = 0; k < PI05_BAR_NEAR; ++k) asm volatile("red.relaxed.gpu.global.add.u32 [%0], 1;\n" ::"l"(bar_copy(cnt, k)) : "memory");
+}
+#endif
+// Whole block waits until *c >= target: thread 0 spins relaxed, then one ld.acquire of *c (the counter only increases, so it also sees >= target;
+// job 20510: it replaces a fence.acq_rel.gpu of ~0.4 us). The CTA barrier extends it to the block. Releases come from one thread after a warp/CTA
+// barrier over the published stores (CUTLASS semaphore pattern).
 __device__ __forceinline__ void block_wait(const unsigned* c, unsigned target, bool backoff) {
   if (threadIdx.x == 0) {
     while (ld_relaxed(c) < target) {
       if (backoff) __nanosleep(64);
     }
-    asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+    (void)ld_acquire(c);
   }
   __syncthreads();
 }
@@ -519,13 +563,13 @@ __device__ __forceinline__ void block_wait(const unsigned* c, unsigned target, b
 #ifndef PI05_BAR_SLEEP
 #define PI05_BAR_SLEEP 0  // grid barrier poll backoff (ns, 0 = none)
 #endif
-// One warp waits until *c >= target (lane 0 spins relaxed, one acquire fence, warp barrier): block_wait for warp tasks.
+// One warp waits until *c >= target (lane 0 spins relaxed, one ld.acquire, warp barrier): block_wait for warp tasks.
 __device__ __forceinline__ void group_wait(const unsigned* c, unsigned target, bool backoff) {
   if ((threadIdx.x & 31) == 0) {
     while (ld_relaxed(c) < target) {
       if (backoff) __nanosleep(64);
     }
-    asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+    (void)ld_acquire(c);
   }
   __syncwarp();
 }
@@ -534,12 +578,7 @@ __device__ __forceinline__ void group_wait(const unsigned* c, unsigned target, b
 __device__ __forceinline__ void st_release(unsigned* ptr, unsigned v) {
   asm volatile("st.release.gpu.global.u32 [%0], %1;\n" ::"l"(ptr), "r"(v) : "memory");
 }
-__device__ __forceinline__ unsigned ld_acquire(const unsigned* ptr) {
-  unsigned v;
-  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n" : "=r"(v) : "l"(ptr) : "memory");
-  return v;
-}
-// Spin until (int)(*ptr - target) >= 0 with acquire loads; debug builds trap after ~2^26 polls.
+// Spin until (int)(*ptr - target) >= 0; debug builds trap after ~2^26 polls.
 __device__ __forceinline__ void spin_acquire(const unsigned* ptr, unsigned target) {
 #ifdef PI05_BAR_DEBUG
   unsigned n = 0;
@@ -547,7 +586,10 @@ __device__ __forceinline__ void spin_acquire(const unsigned* ptr, unsigned targe
 #elif PI05_BAR_SLEEP
   while ((int)(ld_acquire(ptr) - target) < 0) __nanosleep(PI05_BAR_SLEEP);  // U13 v2: -25..-45 ns / barrier in the silo
 #else
-  while ((int)(ld_acquire(ptr) - target) < 0) {}
+  // Relaxed spin, then one ld.acquire (job 20510; was ld.acquire every poll). The value only increases, so the acquire load also sees >= target,
+  // and it gives the synchronizes-with edge.
+  while ((int)(ld_relaxed(ptr) - target) < 0) {}
+  (void)ld_acquire(ptr);
 #endif
 }
 // Grid barrier number `epoch` (1, 2, ... after the zeroing cg barrier). Block writes are
@@ -573,9 +615,14 @@ __device__ __forceinline__ void grid_barrier(unsigned* bar, unsigned epoch) {
 #else
   unsigned* cnt = bar + 160 * BAR_STRIDE;
   if (threadIdx.x == 0) {
+#if PI05_BAR_NEAR > 1
+    bar_arrive_all(cnt);
+    spin_acquire(bar_copy(cnt, bar_near_k), epoch * gridDim.x);
+#else
     unsigned old;
     asm volatile("atom.add.release.gpu.global.u32 %0, [%1], 1;\n" : "=r"(old) : "l"(cnt) : "memory");
     spin_acquire(cnt, epoch * gridDim.x);
+#endif
   }
 #endif
   __syncthreads();
@@ -597,12 +644,20 @@ __device__ __forceinline__ void wpre_arrive(const WPre& w) {
   if (w.pt != nullptr && threadIdx.x == 0) w.pt[0] = globaltimer();
 #endif
   if (threadIdx.x == 0) {
+#if PI05_BAR_NEAR > 1
+    bar_arrive_all(w.bar);
+#else
     unsigned old;
     asm volatile("atom.add.release.gpu.global.u32 %0, [%1], 1;\n" : "=r"(old) : "l"(w.bar) : "memory");
+#endif
   }
 }
 __device__ __forceinline__ void wpre_wait(const WPre& w) {
+#if PI05_BAR_NEAR > 1
+  if (threadIdx.x == 0) spin_acquire(bar_copy(w.bar, bar_near_k), w.target);
+#else
   if (threadIdx.x == 0) spin_acquire(w.bar, w.target);
+#endif
   __syncthreads();
   if (w.stamp != nullptr && threadIdx.x == 0) *w.stamp = TS_NOW();
 #ifdef PI05_PTRACE
@@ -1480,6 +1535,11 @@ __device__ __forceinline__ void action_tail_rows(const Params& p, const float* f
 // (PI05_STOP_STEP, PI05_STOP_LAYER) (both ignored for stage 0, the prologue end), before that stage's
 // trailing barrier. 1 = A, 2 = B, 3 = C3, 4 = D, 5 = E, 6 = F, 7 = G, 8 = H, 9 = I (a run that ends at the
 // last step's last layer ends there anyway). Absent in production builds.
+#if PI05_FG_UMMA
+#define TC_RELEASE() tc_release()  // the TMEM allocated at kernel start is freed before any return
+#else
+#define TC_RELEASE()
+#endif
 #ifdef PI05_STOP_PH
 #ifndef PI05_STOP_STEP
 #define PI05_STOP_STEP 0
@@ -1487,8 +1547,8 @@ __device__ __forceinline__ void action_tail_rows(const Params& p, const float* f
 #ifndef PI05_STOP_LAYER
 #define PI05_STOP_LAYER 0
 #endif
-#define STOP_PRO() { if (PI05_STOP_PH == 0) { cp_async_wait_all(); return; } }
-#define STOP_AT(ph) { if ((ph) == PI05_STOP_PH && step == PI05_STOP_STEP && l == PI05_STOP_LAYER) { cp_async_wait_all(); return; } }
+#define STOP_PRO() { if (PI05_STOP_PH == 0) { cp_async_wait_all(); TC_RELEASE(); return; } }
+#define STOP_AT(ph) { if ((ph) == PI05_STOP_PH && step == PI05_STOP_STEP && l == PI05_STOP_LAYER) { cp_async_wait_all(); TC_RELEASE(); return; } }
 #else
 #define STOP_PRO()
 #define STOP_AT(ph)
@@ -1525,8 +1585,12 @@ struct alignas(64) FgMaps {
 };
 __device__ unsigned g_fg_to;  // mbarrier wait timeouts (host reads through fg_timeouts())
 
-__shared__ __align__(8) unsigned long long fg_bar[48];  // full[0] @0, empty @8 (unused at D = 1), acc @32, rsr @33, abar @34
+__shared__ __align__(8) unsigned long long fg_bar[48];  // full[0] @0, empty @8 (unused at D = 1), acc @32, rsr @33, abar groups @34 .. 37
 __shared__ uint32_t fg_tslot;
+__shared__ uint32_t fg_use;  // completed ab_A / fg_F calls of this CTA: the fg_bar parity is fg_use & 1
+#if PI05_FH_CNT
+__shared__ unsigned* fh_cnt_sh;  // p.cnt + CNT_FH * CNT_STRIDE, set at kernel start (fg_F reads it here: a Params read in fg_F gave an invalid __local__ read)
+#endif
 __shared__ __align__(16) float fg_rs[64];
 
 __device__ __forceinline__ uint32_t su32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
@@ -1554,6 +1618,12 @@ __device__ __forceinline__ void tmem_free64c2(uint32_t tb) { asm volatile("tcgen
 __device__ __forceinline__ void cluster_sync_all() { asm volatile("barrier.cluster.arrive.release;\nbarrier.cluster.wait.acquire;" ::: "memory"); }
 __device__ __forceinline__ void fence_after() { asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory"); }
 __device__ __forceinline__ void fence_before() { asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory"); }
+// End of the kernel (or a truncated debug run): both CTAs of the pair are done with TMEM before warp 1 frees the columns allocated at kernel start.
+__device__ __forceinline__ void tc_release() {
+  __syncthreads();
+  cluster_sync_all();
+  if ((threadIdx.x >> 5) == 1) { fence_after(); tmem_free64c2(fg_tslot); }
+}
 __device__ __forceinline__ void wait_ld() { asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory"); }
 __device__ __forceinline__ unsigned long long sdesc(uint32_t addr) { return (unsigned long long)((addr >> 4) & 0x3fff) | (1ull << 16) | (64ull << 32) | (1ull << 46) | (2ull << 61); }
 __device__ __forceinline__ uint32_t idesc(int N, int M) { return (1u << 4) | (1u << 7) | (1u << 10) | ((uint32_t)(N >> 3) << 17) | ((uint32_t)(M >> 4) << 24); }
@@ -1598,13 +1668,51 @@ __device__ __forceinline__ void fg_E(const Params& p, const FgMaps& m, const flo
     if (lane == 0) p.ssp[task] = ss;
     *reinterpret_cast<__nv_bfloat162*>(m.ap + (t >= 31 ? t + 1 : t) * W + c) = __floats2bfloat162_rn(__fmul_rn(h0, __fadd_rn(1.0f, sc.x)), __fmul_rn(h1, __fadd_rn(1.0f, sc.y)));
   }
-  if (blockIdx.x == 0)
-    for (int i = threadIdx.x; i < W / 2; i += NTHREADS) {
+  // Shift rows 31 / 51: warps 5..7 of blocks 0..5 (576 threads for the 512 pairs). With 148 CTAs these warps own no residual task (task =
+  // warp * 148 + 147 - block >= 800 = T * NSSP), so the rows are written in parallel with the tasks. Before job 20510, block 0 wrote them after its
+  // own tasks and was the last CTA at the E->F and I->A barriers.
+  static_assert(6 * 3 * 32 >= W / 2, "fg_E shift-row map");
+  if (blockIdx.x < 6 && threadIdx.x >= 5 * 32) {
+    const int i = blockIdx.x * 96 + (int)threadIdx.x - 5 * 32;
+    if (i < W / 2) {
       const float2 sh = __ldcg(reinterpret_cast<const float2*>(modF + W + 2 * i));
       *reinterpret_cast<__nv_bfloat162*>(m.ap + 31 * W + 2 * i) = __floats2bfloat162_rn(sh.x, sh.y);
       *reinterpret_cast<__nv_bfloat162*>(m.ap + 51 * W + 2 * i) = __floats2bfloat162_rn(sh.x, sh.y);
     }
+  }
   asm volatile("fence.proxy.async.global;" ::: "memory");  // generic-proxy writes -> visible to the TMA (async proxy) after the barrier
+}
+
+// A / F activation tile (job 20510; was one mbarrier for all 16 chunks): the 16 K64 chunks go out in 4 groups of 4, one mbarrier each
+// (babar + 8 g), so the MMAs start on group 0 while groups 1..3 are in flight. The pair expects (32 + 20) rows x 128 B x 4 chunks per group.
+__device__ __forceinline__ void fg_act_tma(uint32_t bB, const CUtensorMap* tmA, uint32_t babar, int rank) {
+  for (int g = 0; g < 4; ++g) {
+    if (rank == 0) mbar_expect(babar + 8 * g, (32 + 20) * 128 * 4);
+    for (int c = 4 * g; c < 4 * g + 4; ++c) tma2d2(bB + c * FG_BA, tmA, babar + 8 * g, c * 64, rank * 32);
+  }
+}
+// A / F MMAs (warp 1 of the rank-0 CTA): K = 16 chunks of 64, weight tile bW, activation tile bB; group g's MMAs wait only for group g. Same MMA
+// order as one wait for the whole tile, so the result is bit-identical.
+__device__ __forceinline__ void fg_mma16(uint32_t tb, uint32_t bW, uint32_t bB, uint32_t bfull, uint32_t babar, uint32_t bacc, uint32_t ph) {
+  const bool el = elect_one();
+  const unsigned long long dW0 = sdesc(bW), dB0 = sdesc(bB);
+  const uint32_t id = idesc(64, 128);
+  mbar_wait(bfull, ph);
+#pragma unroll
+  for (int g = 0; g < 4; ++g) {
+    mbar_wait(babar + 8 * g, ph);
+    fence_after();
+    if (el) {
+#pragma unroll
+      for (int c = 4 * g; c < 4 * g + 4; ++c) {
+        const unsigned long long dA = dW0 + (unsigned long long)((c * 8192) >> 4), dB = dB0 + (unsigned long long)((c * FG_BA) >> 4);
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) mma_tc2(tb, dA + (unsigned long long)((kk * 32) >> 4), dB + (unsigned long long)((kk * 32) >> 4), id, (c | kk) != 0);
+      }
+    }
+    __syncwarp();
+  }
+  if (el) commit2(bacc);
 }
 
 // F: gate/up GEMM on tcgen05 + epilogue (rs, shift, gelu*up, act store). `w` is the E->F split barrier (arrive after the pair handshake, wait
@@ -1617,15 +1725,9 @@ __device__ __noinline__ void fg_F(const Params& p, const CUtensorMap* tmW, const
   const uint32_t bB = base, bW = base + 16 * BA;
   const uint32_t bf = su32(fg_bar), bfull = bf, bacc = bf + 256, brs = bf + 264, babar = bf + 272;
   const CUtensorMap* tmA = rank == 0 ? tmA32 : tmA20;
-  if (tid == 0) {
-    mbar_init(bfull, 1);
-    mbar_init(bacc, 1); mbar_init(brs, 2); mbar_init(babar, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // earlier phases used this smem through the generic proxy
-  }
-  if (warp == 1) { tmem_alloc64c2(su32(&fg_tslot)); fence_before(); }
-  cluster_sync_all();  // both CTAs' barriers initialised and TMEM allocated before any cross-CTA TMA / MMA traffic
-  fence_after();
+  // The mbarriers and TMEM are set up once at kernel start (job 20510; was per call). A grid barrier is between two uses of fg_bar.
+  const uint32_t ph = fg_use & 1;
+  if (tid == 0) asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // earlier phases used this smem through the generic proxy
   wpre_arrive(w);
   if (tid == 0) {  // PRE: the whole weight tile does not depend on E
     if (rank == 0) mbar_expect(bfull, 2 * SB);
@@ -1636,27 +1738,10 @@ __device__ __noinline__ void fg_F(const Params& p, const CUtensorMap* tmW, const
   const uint32_t tb = fg_tslot;
   if (warp == 0) {
     if (lane == 0) {
-      if (rank == 0) mbar_expect(babar, (32 + 20) * 128 * 16);
-      for (int c = 0; c < 16; ++c) tma2d2(bB + c * BA, tmA, babar, c * 64, rank * 32);
+      fg_act_tma(bB, tmA, babar, rank);
     }
   } else if (warp == 1) {
-    if (rank == 0) {
-      const bool el = elect_one();
-      const unsigned long long dW0 = sdesc(bW), dB0 = sdesc(bB);
-      const uint32_t id = idesc(64, 128);
-      mbar_wait(babar, 0);
-      mbar_wait(bfull, 0);
-      fence_after();
-      if (el) {
-#pragma unroll
-        for (int c = 0; c < KB; ++c) {
-          const unsigned long long dA = dW0 + (unsigned long long)((c * 8192) >> 4), dB = dB0 + (unsigned long long)((c * BA) >> 4);
-#pragma unroll
-          for (int kk = 0; kk < 4; ++kk) mma_tc2(tb, dA + (unsigned long long)((kk * 32) >> 4), dB + (unsigned long long)((kk * 32) >> 4), id, (c | kk) != 0);
-        }
-        commit2(bacc);
-      }
-    }
+    if (rank == 0) fg_mma16(tb, bW, bB, bfull, babar, bacc, ph);
   } else if (warp < 4) {  // rs[t] = rsqrt(sum(ssp[t][0..15]) / W + eps)
     const int t = tid - 64;
     float rsv = 0.f;
@@ -1681,8 +1766,8 @@ __device__ __noinline__ void fg_F(const Params& p, const CUtensorMap* tmW, const
     const bool gf = gate_first != 0;
     const uint32_t scr = bW + warp * 1024;  // per-warp transpose scratch (reuses the weight tile after the MMAs are done)
     uint32_t va[16];
-    mbar_wait(brs, 0);
-    mbar_wait(bacc, 0);
+    mbar_wait(brs, ph);
+    mbar_wait(bacc, ph);
     fence_after();
     asm volatile("tcgen05.ld.sync.aligned.16x256b.x4.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
                  : "=r"(va[0]), "=r"(va[1]), "=r"(va[2]), "=r"(va[3]), "=r"(va[4]), "=r"(va[5]), "=r"(va[6]), "=r"(va[7]), "=r"(va[8]), "=r"(va[9]), "=r"(va[10]),
@@ -1717,10 +1802,15 @@ __device__ __noinline__ void fg_F(const Params& p, const CUtensorMap* tmW, const
     }
   }
 #if PI05_H_UMMA
-  asm volatile("fence.proxy.async.global;" ::: "memory");  // act (generic-proxy stores) -> H's act TMA after the F->H barrier
+  asm volatile("fence.proxy.async.global;" ::: "memory");  // act (generic-proxy stores) -> H's act TMA after the F->H barrier / CNT_FH release
 #endif
   __syncthreads();
-  if (warp == 1) { fence_after(); tmem_free64c2(tb); }
+#if PI05_FH_CNT
+  // All act stores of this tile are done (and its TMEM loads, by the fence_before + CTA barrier above): release H K slice cta / 8. The H pair that
+  // writes this CTA's TMEM next reads slice (cta >> 1) / 4 = cta / 8, so it also waits for this release.
+  if (tid == 0) red_release(fh_cnt_sh + (cta / 8) * CNT_STRIDE);
+#endif
+  if (tid == 0) ++fg_use;
 }
 #endif  // PI05_FG_UMMA
 
@@ -1762,15 +1852,9 @@ __device__ __noinline__ void ab_A(const AbPtrs p, const CUtensorMap* tmWq, const
   const CUtensorMap* tmA = rank == 0 ? tmA32 : tmA20;
   const CUtensorMap* tmW = head < 8 ? tmWq : (head == 8 ? tmWk : tmWv);
   const int c3 = ((head < 8 ? l * QD + head * HD : l * KVD) + j0) >> 3;
-  if (tid == 0) {
-    mbar_init(bfull, 1);
-    mbar_init(bacc, 1); mbar_init(brs, 2); mbar_init(babar, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // earlier phases used this smem through the generic proxy
-  }
-  if (warp == 1) { tmem_alloc64c2(su32(&fg_tslot)); fence_before(); }
-  cluster_sync_all();  // both CTAs' barriers initialised and TMEM allocated before any cross-CTA TMA / MMA traffic
-  fence_after();
+  // The mbarriers and TMEM are set up once at kernel start (job 20510; was per call). A grid barrier is between two uses of fg_bar.
+  const uint32_t ph = fg_use & 1;
+  if (tid == 0) asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // earlier phases used this smem through the generic proxy
   wpre_arrive(w);
   if (tid == 0) {  // PRE: the whole weight tile does not depend on I
     if (rank == 0) mbar_expect(bfull, 2 * SB);
@@ -1792,27 +1876,10 @@ __device__ __noinline__ void ab_A(const AbPtrs p, const CUtensorMap* tmWq, const
   const uint32_t tb = fg_tslot;
   if (warp == 0) {
     if (lane == 0) {
-      if (rank == 0) mbar_expect(babar, (32 + 20) * 128 * 16);
-      for (int c = 0; c < 16; ++c) tma2d2(bB + c * BA, tmA, babar, c * 64, rank * 32);
+      fg_act_tma(bB, tmA, babar, rank);
     }
   } else if (warp == 1) {
-    if (rank == 0) {
-      const bool el = elect_one();
-      const unsigned long long dW0 = sdesc(bW), dB0 = sdesc(bB);
-      const uint32_t id = idesc(64, 128);
-      mbar_wait(babar, 0);
-      mbar_wait(bfull, 0);
-      fence_after();
-      if (el) {
-#pragma unroll
-        for (int c = 0; c < KB; ++c) {
-          const unsigned long long dA = dW0 + (unsigned long long)((c * 8192) >> 4), dB = dB0 + (unsigned long long)((c * BA) >> 4);
-#pragma unroll
-          for (int kk = 0; kk < 4; ++kk) mma_tc2(tb, dA + (unsigned long long)((kk * 32) >> 4), dB + (unsigned long long)((kk * 32) >> 4), id, (c | kk) != 0);
-        }
-        commit2(bacc);
-      }
-    }
+    if (rank == 0) fg_mma16(tb, bW, bB, bfull, babar, bacc, ph);
   } else if (warp < 4) {  // rs[t] = rsqrt(sum(ssp[t][0..15]) / W + eps)
     const int t = tid - 64;
     float rsv = 0.f;
@@ -1832,8 +1899,8 @@ __device__ __noinline__ void ab_A(const AbPtrs p, const CUtensorMap* tmWq, const
     const uint32_t ta = tb + ((uint32_t)(qq * 32 + sub * 16) << 16);
     const uint32_t scr = bW + warp * 1024;  // per-warp transpose scratch (reuses the weight tile after the MMAs are done)
     uint32_t va[16];
-    mbar_wait(brs, 0);
-    mbar_wait(bacc, 0);
+    mbar_wait(brs, ph);
+    mbar_wait(bacc, ph);
     fence_after();
     asm volatile("tcgen05.ld.sync.aligned.16x256b.x4.b32 {%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15}, [%16];"
                  : "=r"(va[0]), "=r"(va[1]), "=r"(va[2]), "=r"(va[3]), "=r"(va[4]), "=r"(va[5]), "=r"(va[6]), "=r"(va[7]), "=r"(va[8]), "=r"(va[9]), "=r"(va[10]),
@@ -1876,7 +1943,7 @@ __device__ __noinline__ void ab_A(const AbPtrs p, const CUtensorMap* tmWq, const
   }
   asm volatile("fence.proxy.async.global;" ::: "memory");  // q / ksuf / vsuf (generic proxy) are read by the K2 attention TMA after the A->C barrier
   __syncthreads();
-  if (warp == 1) { fence_after(); tmem_free64c2(tb); }
+  if (tid == 0) ++fg_use;
 }
 #endif  // PI05_AB_UMMA
 
@@ -1887,6 +1954,7 @@ constexpr int H_RPC = 128, H_NRG = W / (2 * H_RPC);
 constexpr uint32_t H_WCH = H_RPC * 128, H_ACH = 32 * 128;  // bytes of one K64 chunk: weights (128 rows), act (32 tokens)
 __shared__ __align__(8) unsigned long long h_bar[8];  // wbar @0, abar[c] @8 + 8 c, acc @40
 __shared__ uint32_t h_tslot;
+__shared__ uint32_t h_use;  // completed umma_down calls (D and H) of this CTA: the h_bar parity is h_use & 1
 __device__ __forceinline__ void tma3d2(uint32_t dst, const CUtensorMap* m, uint32_t bar, int c0, int c1, int c2) {
   asm volatile("cp.async.bulk.tensor.3d.cta_group::2.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4, %5}], [%2];"
                ::"r"(dst), "l"((unsigned long long)m), "r"(bar & 0xFEFFFFFFu), "r"(c0), "r"(c1), "r"(c2) : "memory"); }
@@ -1899,33 +1967,40 @@ __device__ __forceinline__ void tld16x256(uint32_t ta, uint32_t (&v)[16]) {
 // features n0 = 256 rg + 128 r and supplies tokens 32 r .. 32 r + 31 of the pair's B. One M = 256, N = 64 accumulator (lane = feature, column = token).
 // CTAs >= 8 KS only take part in the split barrier.
 template <int K, int KS>
-__device__ __noinline__ void umma_down(float* part, const CUtensorMap* tmW, const CUtensorMap* tmA, int l, const WPre& w, bf16* smb) {
+// fh_cnt / fh_tgt (H with PI05_FH_CNT only): the CNT_FH K-slice counters and this layer's cumulative target; `w` is then unused.
+__device__ __noinline__ void umma_down(float* part, const CUtensorMap* tmW, const CUtensorMap* tmA, int l, const WPre& w, bf16* smb,
+                                       const unsigned* fh_cnt = nullptr, unsigned fh_tgt = 0) {
   constexpr int H_NCTA = 2 * H_NRG * KS, H_KSL = K / KS, H_NCH = H_KSL / 64;
   static_assert(H_NCTA <= 148 && H_NCH >= 1 && H_NCH <= 4 && H_NCH * (H_WCH + H_ACH) + 1024 <= FG_SMEM && T * (H_RPC * 2 + 16) <= H_NCH * H_WCH, "umma_down geometry");
+  constexpr bool FH = PI05_FH_CNT && K == FF;  // H, not D: no F->H barrier
+  static_assert(!FH || (H_KSL == 8 * 32 && H_NRG == 4), "PI05_FH_CNT: H pair pi reads K slice pi / 4 = F tiles 8 ks .. 8 ks + 7");
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, cta = blockIdx.x, rank = cta & 1;
-  if (cta >= H_NCTA) { wpre_arrive(w); wpre_wait(w); return; }
+  if (cta >= H_NCTA) {
+    if constexpr (!FH) { wpre_arrive(w); wpre_wait(w); }
+    return;
+  }
   const int pi = cta >> 1, rg = pi % H_NRG, ks = pi / H_NRG;
   const int n0 = rg * 2 * H_RPC + rank * H_RPC, k0 = ks * H_KSL;
   const uint32_t bW = (su32(smb) + 1023) & ~1023u, bA = bW + H_NCH * H_WCH;
   const uint32_t mb = su32(h_bar), wbar = mb, abar = mb + 8, bacc = mb + 40;
-  if (tid == 0) {
-    mbar_init(wbar, 1);
-    for (int c = 0; c < H_NCH; ++c) mbar_init(abar + 8 * c, 1);
-    mbar_init(bacc, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // earlier phases used this smem through the generic proxy
-  }
-  if (warp == 1) { tmem_alloc64c2(su32(&h_tslot)); fence_before(); }
-  cluster_sync_all();  // both CTAs' barriers initialised and TMEM allocated before any cross-CTA TMA / MMA traffic
-  fence_after();
-  wpre_arrive(w);
+  // The mbarriers and TMEM are set up once at kernel start (job 20510; was per call). A grid barrier or the CNT_FH wait is between two uses of h_bar.
+  const uint32_t ph = h_use & 1;
+  if (tid == 0) asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // earlier phases used this smem through the generic proxy
+  if constexpr (FH) __syncthreads();  // F's generic smem use on this CTA is done before the weight TMA writes smem
+  else wpre_arrive(w);
   if (tid == 0) {  // the weight slice does not depend on the previous phase: one 3D box {64, 128, H_NCH} before the barrier
     if (rank == 0) mbar_expect(wbar, 2 * H_NCH * H_WCH);
     tma3d2(bW, tmW, wbar, 0, l * W + n0, k0 >> 6);
   }
-  wpre_wait(w);
+  if constexpr (!FH) wpre_wait(w);
   const uint32_t tb = h_tslot;
   if (warp == 0) {
+    if constexpr (FH) {
+      if (lane == 0) {
+        spin_acquire(fh_cnt + ks * CNT_STRIDE, fh_tgt);  // the 8 F tiles of this K slice have stored their act columns
+        asm volatile("fence.proxy.async.global;" ::: "memory");  // F's generic act stores (acquired above) -> the act TMA (async proxy)
+      }
+    }
     if (lane == 0)
       for (int c = 0; c < H_NCH; ++c) {
         if (rank == 0) mbar_expect(abar + 8 * c, 2 * H_ACH);
@@ -1935,9 +2010,9 @@ __device__ __noinline__ void umma_down(float* part, const CUtensorMap* tmW, cons
     const bool el = elect_one();
     const unsigned long long dW0 = sdesc(bW), dA0 = sdesc(bA);
     const uint32_t id = idesc(64, 2 * H_RPC);
-    mbar_wait(wbar, 0);
+    mbar_wait(wbar, ph);
     for (int c = 0; c < H_NCH; ++c) {
-      mbar_wait(abar + 8 * c, 0);
+      mbar_wait(abar + 8 * c, ph);
       fence_after();
       if (el) {
         const unsigned long long dW = dW0 + (unsigned long long)((c * H_WCH) >> 4), dA = dA0 + (unsigned long long)((c * H_ACH) >> 4);
@@ -1954,7 +2029,7 @@ __device__ __noinline__ void umma_down(float* part, const CUtensorMap* tmW, cons
   __syncwarp();
   const int q = warp & 3, hs = warp >> 2;
   constexpr uint32_t SST = H_RPC * 2 + 16;
-  mbar_wait(bacc, 0);
+  mbar_wait(bacc, ph);
   fence_after();
   uint32_t va[2][16];
 #pragma unroll
@@ -1983,7 +2058,7 @@ __device__ __noinline__ void umma_down(float* part, const CUtensorMap* tmW, cons
     *reinterpret_cast<uint4*>(reinterpret_cast<bf16*>(part) + ((size_t)ks * T + t) * W + n0 + pc * 8) = u;
   }
   __syncthreads();
-  if (warp == 1) { fence_after(); tmem_free64c2(tb); }
+  if (tid == 0) ++h_use;
 }
 #endif  // PI05_H_UMMA || PI05_D_UMMA
 #if PI05_H_UMMA
@@ -2386,6 +2461,10 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
   if (threadIdx.x == 0) {
     p.bar[blockIdx.x * BAR_STRIDE] = 0u;
     if (blockIdx.x == 0) p.bar[160 * BAR_STRIDE] = 0u;
+#if PI05_BAR_NEAR > 1
+    if (blockIdx.x == 0)
+      for (unsigned k = 1; k < PI05_BAR_NEAR; ++k) *bar_copy(p.bar + 160 * BAR_STRIDE, k) = 0u;
+#endif
   }
 #if PI05_WPRE
   // The next SYNC() handed to a GEMM phase (same epoch / stamp-slot bookkeeping as SYNC()).
@@ -2459,9 +2538,56 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
     p.rope[i * 2 + 1] = rbf(sinf(ph));
   }
   SYNC0();
+#if PI05_BAR_NEAR > 1
+  if (threadIdx.x == 0) {  // choose the counter copy with the lowest load latency from this SM
+    // 8 dependent relaxed loads of each copy, 2 passes; pass 0 is a warm-up and is not counted. v >> 31 is 0 (the counter is below 2^31), but it
+    // makes each address depend on the previous load, and adding it to dt keeps the loads.
+    const unsigned* c0 = p.bar + 160 * BAR_STRIDE;
+    long long tsum[PI05_BAR_NEAR] = {};
+    unsigned v = 0;
+    for (int pass = 0; pass < 2; ++pass)
+      for (unsigned k = 0; k < PI05_BAR_NEAR; ++k) {
+        const long long t0 = clock64();
+        for (int r = 0; r < 8; ++r) v = ld_relaxed(bar_copy(c0, k) + (v >> 31));
+        const long long dt = clock64() - t0 + (long long)(v >> 31);
+        if (pass) tsum[k] += dt;
+      }
+    unsigned best = 0;
+    for (unsigned k = 1; k < PI05_BAR_NEAR; ++k) if (tsum[k] < tsum[best]) best = k;
+    bar_near_k = best;  // read by this thread only (the barrier poller)
+  }
+#endif
 
   float* smf = reinterpret_cast<float*>(smem_raw);
   bf16* smb = reinterpret_cast<bf16*>(smem_raw);
+#if PI05_FG_UMMA
+  {  // one-time setup of the tcgen05 phases (ab_A, fg_F, umma_down): mbarriers, 64 TMEM columns shared by A, F, D and H (they never overlap on a CTA)
+    if (threadIdx.x == 0) {
+      const uint32_t bf = su32(fg_bar);
+      mbar_init(bf, 1); mbar_init(bf + 256, 1); mbar_init(bf + 264, 2);  // bfull, bacc, brs
+      for (int g = 0; g < 4; ++g) mbar_init(bf + 272 + 8 * g, 1);        // babar groups 0..3
+      fg_use = 0u;
+#if PI05_H_UMMA || PI05_D_UMMA
+      const uint32_t hb = su32(h_bar);
+      mbar_init(hb, 1);                                                 // wbar
+      for (int c = 0; c < 4; ++c) mbar_init(hb + 8 + 8 * c, 1);         // abar[0..3]
+      mbar_init(hb + 40, 1);                                            // acc
+      h_use = 0u;
+#endif
+#if PI05_FH_CNT
+      fh_cnt_sh = p.cnt + CNT_FH * CNT_STRIDE;
+#endif
+      asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    if ((threadIdx.x >> 5) == 1) { tmem_alloc64c2(su32(&fg_tslot)); fence_before(); }
+    cluster_sync_all();  // both CTAs' barriers initialised and TMEM allocated before any cross-CTA TMA / MMA traffic
+    fence_after();
+#if PI05_H_UMMA || PI05_D_UMMA
+    if (threadIdx.x == 0) h_tslot = fg_tslot;
+#endif
+    __syncthreads();
+  }
+#endif
 #if PI05_ATT_K2
   const AkArgs ak{p.prefix_mask, p.attn, p.stats, p.opart, p.cnt, ak_base(smb), (unsigned long long)&atm, (int)((p.fuse & FUSE_BACKOFF) != 0)};
 #endif
@@ -3230,7 +3356,12 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       prefetch_l2(modstep + (size_t)(2 * (l + 1)) * 3 * W, (size_t)3 * W * 4);
 #if PI05_H_UMMA
       const bool hi = false;  // FUSE_HI is rejected on the host
+#if PI05_FH_CNT
+      umma_down<FF, H_KS>(p.part, &fgm.wd, &fgm.act, l, WPre{}, smb, p.cnt + CNT_FH * CNT_STRIDE, it1 * (unsigned)(FF / H_KS / 32));
+      ++tcount;  // no F -> H barrier: keep its stamp slot
+#else
       umma_down<FF, H_KS>(p.part, &fgm.wd, &fgm.act, l, wpre(), smb);
+#endif
 #else
       const bool hi = defnorm && (p.fuse & FUSE_HI);  // I waits on per-group counters instead of the H -> I barrier
       gemm_phase(p.act, FF, p.wd + (size_t)l * W * FF, W, nullptr, W, nullptr, W, p.part, smb,
@@ -3299,6 +3430,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
 #if PI05_WPRE & 1
   if (a_pend) SYNC();  // truncated (debug) runs end on this barrier, as without WPRE
 #endif
+  TC_RELEASE();
   FIT_CAL();
 }
 
@@ -3633,7 +3765,7 @@ std::string build_config() {
   std::string s;
 #define PI05_CFG(name) s += #name "=" PI05_STR(name) " ";
   PI05_CFG(PI05_FG_UMMA) PI05_CFG(PI05_LOAD_HOIST) PI05_CFG(PI05_GEMM_SPREAD) PI05_CFG(PI05_PART_BF16) PI05_CFG(PI05_WPRE)
-  PI05_CFG(PI05_BARRIER) PI05_CFG(PI05_D_WPT) PI05_CFG(PI05_ATT_FA) PI05_CFG(PI05_TAIL) PI05_CFG(PI05_ATT_KEYS) PI05_CFG(PI05_PREFIX)
+  PI05_CFG(PI05_BARRIER) PI05_CFG(PI05_BAR_NEAR) PI05_CFG(PI05_FH_CNT) PI05_CFG(PI05_D_WPT) PI05_CFG(PI05_ATT_FA) PI05_CFG(PI05_TAIL) PI05_CFG(PI05_ATT_KEYS) PI05_CFG(PI05_PREFIX)
   PI05_CFG(PI05_ATT_PREFILL) PI05_CFG(PI05_TILE_ROT) PI05_CFG(PI05_ATT_K2) PI05_CFG(PI05_BAR_SLEEP)
 #if PI05_AB_UMMA
   PI05_CFG(PI05_AB_UMMA)
