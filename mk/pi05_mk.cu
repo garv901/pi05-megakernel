@@ -329,7 +329,19 @@ constexpr unsigned ARR_DE = 2 * PI05_D_WPT * (QD / KC);  // FUSE_DE arrivals per
 #if PI05_FH_CNT && !PI05_H_UMMA
 #error "PI05_FH_CNT needs PI05_H_UMMA"
 #endif
-constexpr int NCNT = CNT_FH + (PI05_FH_CNT ? FF / 256 : 0);  // the CNT_FH counters exist only with PI05_FH_CNT
+// PI05_AC_CNT (default 1 with PI05_AB_UMMA since job 20830; 0 = the A->C grid barrier, control): the K2 attention units wait on two counters, not
+// on the A->C grid barrier. Each A CTA releases CNT_AC (the 32 CTAs of the q heads) or CNT_AC + 1 (the 8 CTAs of the k / v heads) after its q /
+// ksuf / vsuf stores. A unit's TMA thread waits for the 32 q releases of the layer (a tail unit also for the 8 k / v releases) before its Q / suffix
+// K / V TMA. Q is token-major, so every unit needs all 8 q heads: the wait set shrinks from 148 CTAs to 32 (40 for the 13 tail units).
+// Jobs 20830 / 20844 (4 .so copies each, two copy sets): -2.2% at P = 968.
+#ifndef PI05_AC_CNT
+#define PI05_AC_CNT PI05_AB_UMMA
+#endif
+#if PI05_AC_CNT && !PI05_AB_UMMA
+#error "PI05_AC_CNT needs PI05_AB_UMMA"
+#endif
+constexpr int CNT_AC = CNT_FH + (PI05_FH_CNT ? FF / 256 : 0);  // PI05_AC_CNT: q heads, k / v heads
+constexpr int NCNT = CNT_AC + (PI05_AC_CNT ? 2 : 0);  // the CNT_FH / CNT_AC counters exist only with PI05_FH_CNT / PI05_AC_CNT
 // Debug-only per-block attention sub-phase stamps (round 8): CST_N globaltimer values per
 // (step, layer, block) written after the 4096-entry tstamp area. Never set in production.
 #ifdef PI05_CSTAMP
@@ -1836,7 +1848,7 @@ __device__ __forceinline__ void ab_write_shift(const Params& p, bf16* ap, const 
 }
 
 // A + B. Called by every thread of every CTA; CTAs outside 108..147 only take part in the I->A split barrier. Map pointers are passed by value (a const& gave an invalid __local__ read in fg_F).
-struct AbPtrs { const float* rope; const float* ssp; bf16 *q, *ksuf, *vsuf; };  // by value: a reference into the kernel's Params frame gave an invalid __local__ read here
+struct AbPtrs { const float* rope; const float* ssp; bf16 *q, *ksuf, *vsuf; unsigned* cnt; };  // by value: a reference into the kernel's Params frame gave an invalid __local__ read here
 __device__ __noinline__ void ab_A(const AbPtrs p, const CUtensorMap* tmWq, const CUtensorMap* tmWk, const CUtensorMap* tmWv, const CUtensorMap* tmA32, const CUtensorMap* tmA20,
                                   int l, const WPre& w, bf16* smb) {
   constexpr int KB = 16, SB = KB * 8192, BA = FG_BA;
@@ -1944,6 +1956,9 @@ __device__ __noinline__ void ab_A(const AbPtrs p, const CUtensorMap* tmWq, const
   asm volatile("fence.proxy.async.global;" ::: "memory");  // q / ksuf / vsuf (generic proxy) are read by the K2 attention TMA after the A->C barrier
   __syncthreads();
   if (tid == 0) ++fg_use;
+#if PI05_AC_CNT
+  if (tid == 0) red_release(p.cnt + (CNT_AC + (head < 8 ? 0 : 1)) * CNT_STRIDE);  // this CTA's q (or ksuf / vsuf) columns are stored
+#endif
 }
 #endif  // PI05_AB_UMMA
 
@@ -2228,7 +2243,7 @@ __device__ __forceinline__ void ak_qk(uint32_t sb, const uint8_t* Mk, float* smx
 }
 
 // one unit: q (and the tail's suffix K / V) TMA after the B -> C barrier, QK^T + softmax, P.V, partial O + stats, counter release
-__device__ __noinline__ void ak_unit(AkArgs a, int l) {
+__device__ __noinline__ void ak_unit(AkArgs a, int l, unsigned it1) {
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t4 = lane & 3, x = lane & 7;
   if (blockIdx.x >= AK_NUNIT) return;
   int rg, kc; ak_map_of(blockIdx.x, rg, kc);
@@ -2246,6 +2261,12 @@ __device__ __noinline__ void ak_unit(AkArgs a, int l) {
   FIT_EV(FIT_AU0);
   if (tid < KCN) { const int j = j0 + tid; Mk[tid] = j < P ? (a.mask[j] != 0) : (j < NK); }
   if (tid == 0) {
+#if PI05_AC_CNT
+    spin_acquire(a.cnt + CNT_AC * CNT_STRIDE, it1 * 32u);  // the 32 q CTAs of A have stored this layer's q
+    if (tail) spin_acquire(a.cnt + (CNT_AC + 1) * CNT_STRIDE, it1 * 8u);  // and the 8 k / v CTAs its ksuf / vsuf
+#else
+    (void)it1;
+#endif
     asm volatile("fence.proxy.async.global;" ::: "memory");  // generic-proxy writes of the B tasks -> visible to the TMA after the barrier
     const uint32_t bK = sb + AK_OFF_BAR, bV = bK + 8, bQ = bK + 16;
     ak_mbar_expect(bQ, 4 * AK_QBLK);
@@ -2264,8 +2285,7 @@ __device__ __noinline__ void ak_unit(AkArgs a, int l) {
   }
   ak_mbar_wait(sb + AK_OFF_BAR + 16, 0);
 #ifndef PI05_ATT_NOKV
-  ak_mbar_wait(sb + AK_OFF_BAR, 0);
-  ak_mbar_wait(sb + AK_OFF_BAR + 8, 0);
+  ak_mbar_wait(sb + AK_OFF_BAR, 0);  // K. V is waited for before P.V (job 20796; was here): a tail unit's suffix V then lands during QK^T + softmax
 #endif
   __syncthreads();  // loads landed, mask visible
   FIT_EV(FIT_ALD);
@@ -2284,6 +2304,9 @@ __device__ __noinline__ void ak_unit(AkArgs a, int l) {
     const int row = rg * AK_R + tid;
     if (row < QROWS) *reinterpret_cast<float2*>(a.stats + ((size_t)row * AK_NCH + kc) * 2) = make_float2(m, lsum);
   }
+#ifndef PI05_ATT_NOKV
+  ak_mbar_wait(sb + AK_OFF_BAR + 8, 0);
+#endif
   // ---- P.V: warp w = output dims [32w, 32w + 32), both m-tiles
   float acc[2][4][4];
 #pragma unroll
@@ -2668,7 +2691,7 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       if (a_pend) { wa = wpre(); a_pend = false; }
 #endif
 #if PI05_AB_UMMA
-      ab_A(AbPtrs{p.rope, p.ssp, p.q, p.ksuf, p.vsuf}, &fgm.wq, &fgm.wk, &fgm.wv, &fgm.a32, &fgm.a20, l, wa, smb);
+      ab_A(AbPtrs{p.rope, p.ssp, p.q, p.ksuf, p.vsuf, p.cnt}, &fgm.wq, &fgm.wk, &fgm.wv, &fgm.a32, &fgm.a20, l, wa, smb);
       STOP_AT(1)
       // No A->B barrier (A and B are one phase). Keep its stamp slot so slot numbering is unchanged.
       if (p.tstamp != nullptr && blockIdx.x == 0 && threadIdx.x == 0 && tcount < p.tmax) p.tstamp[tcount] = TS_NOW();
@@ -2805,10 +2828,14 @@ __global__ void __launch_bounds__(NTHREADS, 1) pi05_megakernel(Params p) {
       }
 #endif
       CST(9);
+#if PI05_AC_CNT
+      ++tcount;  // no A -> C barrier: keep its stamp slot
+#else
       SYNC();
+#endif
       CST(0);
 #if PI05_ATT_K2
-      ak_unit(ak, l);  // PI05_NULL_ATT keeps only the unit's counter release (inside ak_unit)
+      ak_unit(ak, l, it1);  // PI05_NULL_ATT keeps only the unit's counter release (inside ak_unit)
       CST(5);
 #elif defined(PI05_NULL_ATT)  // dev-only: C's loads / MMAs / softmax / stores skipped; every unit still releases its row-group counter (see the PI05_NULL_ATT note at the top)
       for (int u = blockIdx.x; u < ATT_NRG * ATT_NCHUNK; u += gridDim.x) {
@@ -3765,7 +3792,7 @@ std::string build_config() {
   std::string s;
 #define PI05_CFG(name) s += #name "=" PI05_STR(name) " ";
   PI05_CFG(PI05_FG_UMMA) PI05_CFG(PI05_LOAD_HOIST) PI05_CFG(PI05_GEMM_SPREAD) PI05_CFG(PI05_PART_BF16) PI05_CFG(PI05_WPRE)
-  PI05_CFG(PI05_BARRIER) PI05_CFG(PI05_BAR_NEAR) PI05_CFG(PI05_FH_CNT) PI05_CFG(PI05_D_WPT) PI05_CFG(PI05_ATT_FA) PI05_CFG(PI05_TAIL) PI05_CFG(PI05_ATT_KEYS) PI05_CFG(PI05_PREFIX)
+  PI05_CFG(PI05_BARRIER) PI05_CFG(PI05_BAR_NEAR) PI05_CFG(PI05_FH_CNT) PI05_CFG(PI05_AC_CNT) PI05_CFG(PI05_D_WPT) PI05_CFG(PI05_ATT_FA) PI05_CFG(PI05_TAIL) PI05_CFG(PI05_ATT_KEYS) PI05_CFG(PI05_PREFIX)
   PI05_CFG(PI05_ATT_PREFILL) PI05_CFG(PI05_TILE_ROT) PI05_CFG(PI05_ATT_K2) PI05_CFG(PI05_BAR_SLEEP)
 #if PI05_AB_UMMA
   PI05_CFG(PI05_AB_UMMA)
