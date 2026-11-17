@@ -174,6 +174,47 @@ class MegakernelArm:
                 raise ValueError(f"{name} must be contiguous")
             tensors.append(value)
         self.tensors = tensors
+        candidates = int(os.environ.get("PI05_WS_TUNE", "0"))
+        if candidates > 0:
+            self.tune_workspace(candidates)
+
+    def tune_workspace(self, candidates: int, launches: int = 5) -> None:
+        """Pick the workspace placement with the lowest launch time. Off by default; PI05_WS_TUNE=<candidates> runs it from bind().
+
+        The launch time depends on where the workspace sits in memory. Over many placements the median launch time spreads by ~4%,
+        about 2% of the placements are within 1% of the best one, and a given placement is stable. The candidates are windows of one
+        larger allocation, 1/8 of a workspace apart (400 candidates = 1.4 GB). Each candidate is timed with `launches` launches after
+        2 warm-up launches, and the fastest one is kept. 400 candidates miss a fast window with a probability below 0.1%
+        (100 candidates: ~13%). The kernel is not changed."""
+        def median_ms() -> float:
+            self.launch()
+            self.launch()
+            torch.cuda.synchronize()
+            times = []
+            for _ in range(launches):
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record()
+                self.launch()
+                end.record()
+                end.synchronize()
+                times.append(start.elapsed_time(end))
+            return sorted(times)[len(times) // 2]
+
+        with torch.cuda.device(self.device):
+            natural = median_ms()
+            size = self.ws.numel()
+            step = (size // 8) & ~4095
+            pool = torch.empty(size + candidates * step, dtype=torch.uint8, device=self.device)
+            medians = []
+            for k in range(candidates):
+                self.ws = pool[k * step:k * step + size]
+                medians.append(median_ms())
+            best = min(range(candidates), key=lambda k: medians[k])
+            self.ws = pool[best * step:best * step + size]
+            self._ws_pool = pool  # keeps the allocation alive
+        ordered = sorted(medians)
+        self.config["ws_tune"] = {"candidates": candidates, "natural_ms": natural, "best_ms": medians[best],
+                                  "median_ms": ordered[len(ordered) // 2], "worst_ms": ordered[-1]}
 
     def launch(self) -> None:
         self.ext.launch(self.tensors, self.actions, self.ws, self.geo.steps, self.geo.layers,
